@@ -1,42 +1,33 @@
 # Goproxy
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/goproxy/goproxy)](https://goreportcard.com/report/github.com/goproxy/goproxy)
-[![GoDoc](https://godoc.org/github.com/goproxy/goproxy?status.svg)](https://godoc.org/github.com/goproxy/goproxy)
+[![PkgGoDev](https://pkg.go.dev/badge/github.com/goproxy/goproxy)](https://pkg.go.dev/github.com/goproxy/goproxy)
 
 A minimalist Go module proxy handler.
 
-Goproxy has fully implemented the Go's
-[module proxy protocol](https://golang.org/cmd/go/#hdr-Module_proxy_protocol).
-Our goal is to find the most dead simple way to provide a minimalist handler
-that can act as a full-featured Go module proxy for those who want to build
-their own proxies. Yeah, there is no `Makefile`, no configuration files, no
-crazy file organization, no lengthy documentation, no annoying stuff, just a
-[`goproxy.Goproxy`](https://godoc.org/github.com/goproxy/goproxy#Goproxy) that
-implements the [`http.Handler`](https://godoc.org/net/http#Handler).
+Goproxy has fully implemented the
+[GOPROXY protocol](https://golang.org/ref/mod#goproxy-protocol). Our goal is to
+find the most dead simple way to provide a minimalist handler that can act as a
+full-featured Go module proxy for those who want to build their own proxies.
+Yeah, there is no `Makefile`, no configuration files, no crazy file
+organization, no lengthy documentation, no annoying stuff, just a
+[`goproxy.Goproxy`](https://pkg.go.dev/github.com/goproxy/goproxy#Goproxy) that
+implements the [`http.Handler`](https://pkg.go.dev/net/http#Handler).
 
 ## Features
 
 * Extremely easy to use
-	* One struct: [`goproxy.Goproxy`](https://godoc.org/github.com/goproxy/goproxy#Goproxy)
-	* Two interfaces: [`goproxy.Cacher`](https://godoc.org/github.com/goproxy/goproxy#Cacher) and [`goproxy.Cache`](https://godoc.org/github.com/goproxy/goproxy#Cache)
-* Built-in [`GOPROXY`](https://golang.org/cmd/go/#hdr-Environment_variables) support
+	* Two structs: [`goproxy.Goproxy`](https://pkg.go.dev/github.com/goproxy/goproxy#Goproxy) and [`goproxy.DirCacher`](https://pkg.go.dev/github.com/goproxy/goproxy#DirCacher)
+	* One interface: [`goproxy.Cacher`](https://pkg.go.dev/github.com/goproxy/goproxy#Cacher)
+* Built-in [`GOPROXY`](https://golang.org/ref/mod#environment-variables) support
 	* Defaulted to `https://proxy.golang.org,direct` (just like what Go is doing right now)
-* Built-in [`GONOPROXY`](https://golang.org/cmd/go/#hdr-Environment_variables) support
-* Built-in [`GOSUMDB`](https://golang.org/cmd/go/#hdr-Environment_variables) support
+* Built-in [`GONOPROXY`](https://golang.org/ref/mod#environment-variables) support
+* Built-in [`GOSUMDB`](https://golang.org/ref/mod#environment-variables) support
 	* Defaulted to `sum.golang.org` (just like what Go is doing right now)
-* Built-in [`GONOSUMDB`](https://golang.org/cmd/go/#hdr-Environment_variables) support
-* Built-in [`GOPRIVATE`](https://golang.org/cmd/go/#hdr-Environment_variables) support
-* Supports serving under other Go module proxies by setting [`GOPROXY`](https://golang.org/cmd/go/#hdr-Environment_variables)
+* Built-in [`GONOSUMDB`](https://golang.org/ref/mod#environment-variables) support
+* Built-in [`GOPRIVATE`](https://golang.org/ref/mod#environment-variables) support
+* Supports serving under other Go module proxies by setting [`GOPROXY`](https://golang.org/ref/mod#environment-variables)
 * Supports [proxying checksum databases](http://golang.org/design/25530-sumdb#proxying-a-checksum-database)
-* Supports multiple mainstream implementations of the [`goproxy.Cacher`](https://godoc.org/github.com/goproxy/goproxy#Cacher)
-	* Disk: [`cacher.Disk`](https://godoc.org/github.com/goproxy/goproxy/cacher#Disk)
-	* MinIO: [`cacher.MinIO`](https://godoc.org/github.com/goproxy/goproxy/cacher#MinIO)
-	* Google Cloud Storage: [`cacher.GCS`](https://godoc.org/github.com/goproxy/goproxy/cacher#GCS)
-	* Amazon Simple Storage Service: [`cacher.S3`](https://godoc.org/github.com/goproxy/goproxy/cacher#S3)
-	* Microsoft Azure Blob Storage: [`cacher.MABS`](https://godoc.org/github.com/goproxy/goproxy/cacher#MABS)
-	* DigitalOcean Spaces: [`cacher.DOS`](https://godoc.org/github.com/goproxy/goproxy/cacher#DOS)
-	* Alibaba Cloud Object Storage Service: [`cacher.OSS`](https://godoc.org/github.com/goproxy/goproxy/cacher#OSS)
-	* Qiniu Cloud Kodo: [`cacher.Kodo`](https://godoc.org/github.com/goproxy/goproxy/cacher#Kodo)
 
 ## Installation
 
@@ -48,7 +39,7 @@ $ go get github.com/goproxy/goproxy
 
 done.
 
-> The only requirement is the [Go](https://golang.org), at least v1.12.
+> The only requirement is the [Go](https://golang.org), at least v1.13.
 
 ## Quick Start
 
@@ -64,7 +55,7 @@ import (
 )
 
 func main() {
-	http.ListenAndServe("localhost:8080", goproxy.New())
+	http.ListenAndServe("localhost:8080", &goproxy.Goproxy{})
 }
 ```
 
@@ -140,6 +131,6 @@ requests [here](https://github.com/goproxy/goproxy/pulls).
 
 ## License
 
-This project is licensed under the Unlicense.
+This project is licensed under the MIT License.
 
 License can be found [here](LICENSE).

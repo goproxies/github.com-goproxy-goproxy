@@ -2,153 +2,91 @@ package goproxy
 
 import (
 	"context"
-	"errors"
-	"hash"
 	"io"
-	"mime"
+	"io/ioutil"
 	"os"
-	"path"
-	"strings"
-	"time"
+	"path/filepath"
 )
 
-// ErrCacheNotFound is the error resulting if a path search failed to find a
-// cache.
-var ErrCacheNotFound = errors.New("cache not found")
-
-// Cacher is the interface that defines a set of methods used to cache module
-// files for the `Goproxy`.
-//
-// If you are looking for some useful implementations of the `Cacher`, simply
-// visit the "github.com/goproxy/goproxy/cacher" package.
+// Cacher defines a set of intuitive methods used to cache module files for the
+// `Goproxy`.
 type Cacher interface {
-	// NewHash returns a new instance of the `hash.Hash` used to compute the
-	// checksums of the caches in the underlying cacher.
-	NewHash() hash.Hash
-
-	// Cache returns the matched `Cache` for the name from the underlying
-	// cacher. It returns the `ErrCacheNotFound` if not found.
+	// Get gets the matched cache for the name. It returns the
+	// `os.ErrNotExist` if not found.
 	//
-	// It is the caller's responsibility to close the returned `Cache`.
-	Cache(ctx context.Context, name string) (Cache, error)
-
-	// SetCache sets the c to the underlying cacher.
+	// It is the caller's responsibility to close the returned
+	// `io.ReadCloser`.
 	//
-	// It is the caller's responsibility to close the c.
-	SetCache(ctx context.Context, c Cache) error
+	// Note that the returned `io.ReadCloser` can optionally implement the
+	// following interfaces:
+	//   * `io.Seeker`
+	//       For the Range request header.
+	//   * `interface{ ModTime() time.Time }`
+	//       For the Last-Modified response header.
+	//   * `interface{ Checksum() []byte }`
+	//       For the ETag response header.
+	Get(ctx context.Context, name string) (io.ReadCloser, error)
+
+	// Set sets the content as a cache with the name.
+	Set(ctx context.Context, name string, content io.ReadSeeker) error
 }
 
-// Cache is the cache unit of the `Cacher`.
-type Cache interface {
-	io.Reader
-	io.Seeker
-	io.Closer
+// DirCacher implements the `Cacher` using a directory on the local filesystem.
+// If the directory does not exist, it will be created with 0700 permissions.
+type DirCacher string
 
-	// Name returns the unique Unix path style name of the underlying cache.
-	Name() string
+// Get implements the `Cacher`.
+func (dc DirCacher) Get(
+	ctx context.Context,
+	name string,
+) (io.ReadCloser, error) {
+	fileName := filepath.Join(string(dc), filepath.FromSlash(name))
 
-	// MIMEType returns the MIME type of the underlying cache.
-	MIMEType() string
-
-	// Size returns the length in bytes of the underlying cache.
-	Size() int64
-
-	// ModTime returns the modification time of the underlying cache.
-	ModTime() time.Time
-
-	// Checksum returns the checksum of the underlying cache.
-	Checksum() []byte
-}
-
-// tempCache implements the `Cache`.
-type tempCache struct {
-	file     *os.File
-	name     string
-	mimeType string
-	size     int64
-	modTime  time.Time
-	checksum []byte
-}
-
-// newTempCache returns a new instance of the `tempCache` with the filename,
-// name, and fileHash.
-func newTempCache(filename, name string, fileHash hash.Hash) (Cache, error) {
-	file, err := os.Open(filename)
+	fileInfo, err := os.Stat(fileName)
 	if err != nil {
 		return nil, err
 	}
 
-	var mimeType string
-	switch ext := strings.ToLower(path.Ext(name)); ext {
-	case ".info":
-		mimeType = "application/json; charset=utf-8"
-	case ".mod":
-		mimeType = "text/plain; charset=utf-8"
-	case ".zip":
-		mimeType = "application/zip"
-	default:
-		mimeType = mime.TypeByExtension(ext)
-	}
-
-	fileInfo, err := file.Stat()
+	file, err := os.Open(fileName)
 	if err != nil {
 		return nil, err
 	}
 
-	if _, err := io.Copy(fileHash, file); err != nil {
-		return nil, err
-	}
-
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return nil, err
-	}
-
-	return &tempCache{
-		file:     file,
-		name:     name,
-		mimeType: mimeType,
-		size:     fileInfo.Size(),
-		modTime:  fileInfo.ModTime(),
-		checksum: fileHash.Sum(nil),
+	return &struct {
+		*os.File
+		os.FileInfo
+	}{
+		File:     file,
+		FileInfo: fileInfo,
 	}, nil
 }
 
-// Read implements the `Cache`.
-func (tc *tempCache) Read(b []byte) (int, error) {
-	return tc.file.Read(b)
-}
+// Set implements the `Cacher`.
+func (dc DirCacher) Set(
+	ctx context.Context,
+	name string,
+	content io.ReadSeeker,
+) error {
+	fileName := filepath.Join(string(dc), filepath.FromSlash(name))
 
-// Seek implements the `Cache`.
-func (tc *tempCache) Seek(offset int64, whence int) (int64, error) {
-	return tc.file.Seek(offset, whence)
-}
+	dir := filepath.Dir(fileName)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
+	}
 
-// Close implements the `Cache`.
-func (tc *tempCache) Close() error {
-	return tc.file.Close()
-}
+	file, err := ioutil.TempFile(dir, "")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
 
-// Name implements the `Cache`.
-func (tc *tempCache) Name() string {
-	return tc.name
-}
+	if _, err := io.Copy(file, content); err != nil {
+		return err
+	}
 
-// MIMEType implements the `Cache`.
-func (tc *tempCache) MIMEType() string {
-	return tc.mimeType
-}
+	if err := file.Close(); err != nil {
+		return err
+	}
 
-// Size implements the `Cache`.
-func (tc *tempCache) Size() int64 {
-	return tc.size
-}
-
-// ModTime implements the `Cache`.
-func (tc *tempCache) ModTime() time.Time {
-	return tc.modTime
-}
-
-// Checksum implements the `Cache`.
-func (tc *tempCache) Checksum() []byte {
-	return tc.checksum
+	return os.Rename(file.Name(), fileName)
 }

@@ -4,23 +4,19 @@ Package goproxy implements a minimalist Go module proxy handler.
 package goproxy
 
 import (
+	"bytes"
 	"context"
-	"crypto/md5"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash"
 	"io"
 	"io/ioutil"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,148 +25,121 @@ import (
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
 	"golang.org/x/mod/sumdb"
-	"golang.org/x/mod/sumdb/dirhash"
 	"golang.org/x/net/idna"
 )
 
 // Goproxy is the top-level struct of this project.
 //
 // Note that the `Goproxy` will not mess with your environment variables, it
-// will still follow your GOPROXY, GONOPROXY, GOSUMDB, GONOSUMDB, and GOPRIVATE.
+// will still follow your GOPROXY, GONOPROXY, GOSUMDB, GONOSUMDB and GOPRIVATE.
 // It means that you can set GOPROXY to serve the `Goproxy` itself under other
 // proxies, and by setting GONOPROXY and GOPRIVATE to indicate which modules the
 // `Goproxy` should download directly instead of using those proxies. And of
-// course, you can also set GOSUMDB, GONOSUMDB, and GOPRIVATE to indicate how
+// course, you can also set GOSUMDB, GONOSUMDB and GOPRIVATE to indicate how
 // the `Goproxy` should verify the modules.
 //
-// ATTENTION: Since GONOPROXY, GOSUMDB, GONOSUMDB, and GOPRIVATE were first
-// introduced in Go 1.13, so we implemented a built-in support for them. Now,
-// you can set them even before Go 1.13.
+// Since GOPROXY with comma-separated list support, GONOPROXY, GOSUMDB,
+// GONOSUMDB and GOPRIVATE were first introduced in Go 1.13, so we implemented a
+// built-in support for them. Now, you can set them even the version of the Go
+// binary targeted by the `Goproxy.GoBinName` is before v1.13.
 //
 // It is highly recommended not to modify the value of any field of the
 // `Goproxy` after calling the `Goproxy.ServeHTTP`, which will cause
 // unpredictable problems.
-//
-// The new instances of the `Goproxy` should only be created by calling the
-// `New`.
 type Goproxy struct {
 	// GoBinName is the name of the Go binary.
 	//
-	// Default value: "go"
+	// If the `GoBinName` is empty, the "go" is used.
+	//
+	// Not that the version of the Go binary targeted by the `GoBinName`
+	// must be at least v1.11.
 	GoBinName string `mapstructure:"go_bin_name"`
 
 	// GoBinEnv is the environment of the Go binary. Each entry is of the
 	// form "key=value".
 	//
+	// If the `GoBinEnv` is nil, the result of the `os.Environ()` is used.
+	//
 	// If the `GoBinEnv` contains duplicate environment keys, only the last
 	// value in the slice for each duplicate key is used.
 	//
-	// Default value: `os.Environ()`
+	// Note that GOPROXY (with comma-separated list support), GONOPROXY,
+	// GOSUMDB, GONOSUMDB and GOPRIVATE are built-in supported. It means
+	// that they can be set even the version of the Go binary targeted by
+	// the `GoBinName` is before v1.13.
 	GoBinEnv []string `mapstructure:"go_bin_env"`
 
-	// GoBinMaxWorkers is the maximum number of the Go binary commands that
-	// are allowed to execute at the same time.
+	// GoBinMaxWorkers is the maximum number of commands allowed for the Go
+	// binary to execute at the same time.
 	//
-	// If the `GoBinMaxWorkers` is zero, then there will be no limitations.
-	//
-	// Default value: 0
+	// If the `GoBinMaxWorkers` is zero, there is no limitation.
 	GoBinMaxWorkers int `mapstructure:"go_bin_max_workers"`
 
 	// PathPrefix is the prefix of all request paths. It will be used to
 	// trim the request paths via the `strings.TrimPrefix`.
 	//
-	// Note that when the `PathPrefix` is not empty, then it should start
-	// with "/".
-	//
-	// Default value: ""
+	// If the `PathPrefix` is not empty, it must start with "/", and usually
+	// should also end with "/".
 	PathPrefix string `mapstructure:"path_prefix"`
 
 	// Cacher is the `Cacher` that used to cache module files.
 	//
 	// If the `Cacher` is nil, the module files will be temporarily stored
 	// in the local disk and discarded as the request ends.
-	//
-	// Default value: nil
-	Cacher Cacher `mapstructure:"cacher"`
+	Cacher Cacher `mapstructure:"-"`
 
-	// CacherMaxCacheBytes is the maximum number of bytes of the cache that
-	// will be stored in the `Cacher`.
+	// CacherMaxCacheBytes is the maximum number of bytes allowed for the
+	// `Cacher` to store a cache.
 	//
-	// If the `CacherMaxCacheBytes` is zero, then there will be no
-	// limitations.
-	//
-	// Default value: 0
+	// If the `CacherMaxCacheBytes` is zero, there is no limitation.
 	CacherMaxCacheBytes int `mapstructure:"cacher_max_cache_bytes"`
 
-	// ProxiedSUMDBs is the proxied checksum databases. Each value should be
-	// given the format of "<sumdb-name>" or "<sumdb-name> <sumdb-URL>". The
-	// first format can be seen as a shorthand for the second format. In the
-	// case of the first format, the corresponding checksum database URL
-	// will be the checksum database name itself as a host with an "https"
-	// scheme.
+	// ProxiedSUMDBs is the list of proxied checksum databases.
 	//
-	// Default value: nil
+	// If the `ProxiedSUMDBs` is not nil, each value should be given the
+	// format of "<sumdb-name>" or "<sumdb-name> <sumdb-URL>". The first
+	// format can be seen as a shorthand for the second format. In the case
+	// of the first format, the corresponding checksum database URL will be
+	// the checksum database name itself as a host with an "https" scheme.
 	ProxiedSUMDBs []string `mapstructure:"proxied_sumdbs"`
 
-	// InsecureMode indicates whether the insecure mode is enabled.
+	// Transport is used to perform all requests except those started by
+	// calling the Go binary targeted by the `GoBinName`.
 	//
-	// If the `InsecureMode` is true, TLS accepts any certificate presented
-	// by the server and any host name in that certificate.
-	InsecureMode bool `mapstructure:"insecure_mode"`
+	// If the `Transport` is nil, the `http.DefaultTransport` is used.
+	Transport http.RoundTripper `mapstructure:"-"`
 
 	// ErrorLogger is the `log.Logger` that logs errors that occur while
 	// proxying.
 	//
 	// If the `ErrorLogger` is nil, logging is done via the "log" package's
 	// standard logger.
-	//
-	// Default value: nil
 	ErrorLogger *log.Logger `mapstructure:"-"`
 
-	loadOnce        *sync.Once
-	httpClient      *http.Client
+	loadOnce        sync.Once
+	goBinName       string
 	goBinEnv        map[string]string
 	goBinWorkerChan chan struct{}
-	sumdbClient     *sumdb.Client
 	proxiedSUMDBs   map[string]string
-}
-
-// New returns a new instance of the `Goproxy` with default field values.
-//
-// The `New` is the only function that creates new instances of the `Goproxy`
-// and keeps everything working.
-func New() *Goproxy {
-	return &Goproxy{
-		GoBinName: "go",
-		GoBinEnv:  os.Environ(),
-		loadOnce:  &sync.Once{},
-		httpClient: &http.Client{
-			Transport: &http.Transport{
-				Proxy: http.ProxyFromEnvironment,
-				DialContext: (&net.Dialer{
-					Timeout:   30 * time.Second,
-					KeepAlive: 30 * time.Second,
-					DualStack: true,
-				}).DialContext,
-				TLSClientConfig:       &tls.Config{},
-				MaxIdleConnsPerHost:   1024,
-				IdleConnTimeout:       90 * time.Second,
-				TLSHandshakeTimeout:   10 * time.Second,
-				ExpectContinueTimeout: 1 * time.Second,
-			},
-			Timeout: time.Minute,
-		},
-		goBinEnv:      map[string]string{},
-		proxiedSUMDBs: map[string]string{},
-	}
+	httpClient      *http.Client
+	sumdbClient     *sumdb.Client
 }
 
 // load loads the stuff of the g up.
 func (g *Goproxy) load() {
-	g.httpClient.Transport.(*http.Transport).
-		TLSClientConfig.InsecureSkipVerify = g.InsecureMode
+	if g.GoBinName != "" {
+		g.goBinName = g.GoBinName
+	} else {
+		g.goBinName = "go"
+	}
 
-	for _, env := range g.GoBinEnv {
+	goBinEnv := g.GoBinEnv
+	if goBinEnv == nil {
+		goBinEnv = os.Environ()
+	}
+
+	g.goBinEnv = map[string]string{}
+	for _, env := range goBinEnv {
 		parts := strings.SplitN(env, "=", 2)
 		if len(parts) != 2 {
 			continue
@@ -179,21 +148,35 @@ func (g *Goproxy) load() {
 		g.goBinEnv[parts[0]] = parts[1]
 	}
 
-	var proxies []string
-	for _, proxy := range strings.Split(g.goBinEnv["GOPROXY"], ",") {
-		proxy = strings.TrimSpace(proxy)
-		if proxy == "" {
-			continue
+	var envGOPROXY string
+	for goproxy := g.goBinEnv["GOPROXY"]; goproxy != ""; {
+		var proxy, sep string
+		if i := strings.IndexAny(goproxy, ",|"); i >= 0 {
+			proxy = goproxy[:i]
+			sep = string(goproxy[i])
+			goproxy = goproxy[i+1:]
+			if goproxy == "" {
+				sep = ""
+			}
+		} else {
+			proxy = goproxy
+			goproxy = ""
 		}
 
-		proxies = append(proxies, proxy)
-		if proxy == "direct" || proxy == "off" {
-			break
+		proxy = strings.TrimSpace(proxy)
+		switch proxy {
+		case "":
+			continue
+		case "direct", "off":
+			sep = ""
+			goproxy = ""
 		}
+
+		envGOPROXY = fmt.Sprint(envGOPROXY, proxy, sep)
 	}
 
-	if len(proxies) > 0 {
-		g.goBinEnv["GOPROXY"] = strings.Join(proxies, ",")
+	if envGOPROXY != "" {
+		g.goBinEnv["GOPROXY"] = envGOPROXY
 	} else if g.goBinEnv["GOPROXY"] == "" {
 		g.goBinEnv["GOPROXY"] = "https://proxy.golang.org,direct"
 	} else {
@@ -201,10 +184,8 @@ func (g *Goproxy) load() {
 	}
 
 	g.goBinEnv["GOSUMDB"] = strings.TrimSpace(g.goBinEnv["GOSUMDB"])
-	switch g.goBinEnv["GOSUMDB"] {
-	case "", "sum.golang.org":
-		g.goBinEnv["GOSUMDB"] = "sum.golang.org" +
-			"+033de0ae+Ac4zctda0e5eza+HJyk9SxEdh+s3Ux18htTTAD8OuAn8"
+	if g.goBinEnv["GOSUMDB"] == "" {
+		g.goBinEnv["GOSUMDB"] = "sum.golang.org"
 	}
 
 	if g.goBinEnv["GONOPROXY"] == "" {
@@ -247,15 +228,9 @@ func (g *Goproxy) load() {
 		g.goBinWorkerChan = make(chan struct{}, g.GoBinMaxWorkers)
 	}
 
-	g.sumdbClient = sumdb.NewClient(&sumdbClientOps{
-		envGOPROXY:  g.goBinEnv["GOPROXY"],
-		envGOSUMDB:  g.goBinEnv["GOSUMDB"],
-		httpClient:  g.httpClient,
-		errorLogger: g.ErrorLogger,
-	})
-
-	for _, sumdb := range g.ProxiedSUMDBs {
-		sumdbParts := strings.Fields(sumdb)
+	g.proxiedSUMDBs = map[string]string{}
+	for _, proxiedSUMDB := range g.ProxiedSUMDBs {
+		sumdbParts := strings.Fields(proxiedSUMDB)
 
 		sumdbName, err := idna.Lookup.ToASCII(sumdbParts[0])
 		if err != nil {
@@ -268,6 +243,17 @@ func (g *Goproxy) load() {
 			g.proxiedSUMDBs[sumdbName] = sumdbName
 		}
 	}
+
+	g.httpClient = &http.Client{
+		Transport: g.Transport,
+	}
+
+	g.sumdbClient = sumdb.NewClient(&sumdbClientOps{
+		envGOPROXY: g.goBinEnv["GOPROXY"],
+		envGOSUMDB: g.goBinEnv["GOSUMDB"],
+		httpClient: g.httpClient,
+		logError:   g.logError,
+	})
 }
 
 // ServeHTTP implements the `http.Handler`.
@@ -277,74 +263,72 @@ func (g *Goproxy) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
 	default:
-		setResponseCacheControlHeader(rw, 86400)
-		responseMethodNotAllowed(rw)
+		responseMethodNotAllowed(rw, 86400)
 		return
 	}
 
-	if !strings.HasPrefix(r.URL.Path, "/") {
-		setResponseCacheControlHeader(rw, 86400)
-		responseNotFound(rw)
+	name, err := url.PathUnescape(r.URL.Path)
+	if err != nil ||
+		!strings.HasPrefix(name, "/") ||
+		strings.HasSuffix(name, "/") {
+		responseNotFound(rw, 86400)
 		return
 	}
 
-	trimmedPath := path.Clean(r.URL.Path)
+	if strings.Contains(name, "..") {
+		for _, part := range strings.Split(name, "/") {
+			if part == ".." {
+				responseNotFound(rw, 86400)
+				return
+			}
+		}
+	}
+
+	name = path.Clean(name)
 	if g.PathPrefix != "" {
-		trimmedPath = strings.TrimPrefix(trimmedPath, g.PathPrefix)
+		name = strings.TrimPrefix(name, g.PathPrefix)
 	} else {
-		trimmedPath = strings.TrimPrefix(trimmedPath, "/")
-	}
-
-	name, err := url.PathUnescape(trimmedPath)
-	if err != nil {
-		setResponseCacheControlHeader(rw, 86400)
-		responseNotFound(rw)
-		return
+		name = strings.TrimPrefix(name, "/")
 	}
 
 	if strings.HasPrefix(name, "sumdb/") {
 		sumdbURL, err := parseRawURL(strings.TrimPrefix(name, "sumdb/"))
 		if err != nil {
-			setResponseCacheControlHeader(rw, 86400)
-			responseNotFound(rw)
+			responseNotFound(rw, 86400)
 			return
 		}
 
 		sumdbName, err := idna.Lookup.ToASCII(sumdbURL.Host)
 		if err != nil {
-			setResponseCacheControlHeader(rw, 86400)
-			responseNotFound(rw)
+			responseNotFound(rw, 86400)
 			return
 		}
 
 		if g.proxiedSUMDBs[sumdbName] == "" {
-			setResponseCacheControlHeader(rw, 86400)
-			responseNotFound(rw)
+			responseNotFound(rw, 86400)
 			return
 		}
 
 		var (
-			contentType string
-			maxAge      int
+			contentType        string
+			cacheControlMaxAge int
 		)
 
-		switch {
-		case sumdbURL.Path == "/supported":
+		if sumdbURL.Path == "/supported" {
 			setResponseCacheControlHeader(rw, 86400)
 			rw.Write(nil) // 200 OK
 			return
-		case sumdbURL.Path == "/latest":
+		} else if sumdbURL.Path == "/latest" {
 			contentType = "text/plain; charset=utf-8"
-			maxAge = 3600
-		case strings.HasPrefix(sumdbURL.Path, "/lookup/"):
+			cacheControlMaxAge = 3600
+		} else if strings.HasPrefix(sumdbURL.Path, "/lookup/") {
 			contentType = "text/plain; charset=utf-8"
-			maxAge = 86400
-		case strings.HasPrefix(sumdbURL.Path, "/tile/"):
+			cacheControlMaxAge = 86400
+		} else if strings.HasPrefix(sumdbURL.Path, "/tile/") {
 			contentType = "application/octet-stream"
-			maxAge = 86400
-		default:
-			setResponseCacheControlHeader(rw, 86400)
-			responseNotFound(rw)
+			cacheControlMaxAge = 86400
+		} else {
+			responseNotFound(rw, 86400)
 			return
 		}
 
@@ -358,104 +342,50 @@ func (g *Goproxy) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		sumdbReq, err := http.NewRequest(
-			http.MethodGet,
+		var buf bytes.Buffer
+		if err := httpGet(
+			r.Context(),
+			g.httpClient,
 			sumdbURL.String(),
-			nil,
-		)
-		if err != nil {
+			&buf,
+		); err != nil {
 			g.logError(err)
-			responseInternalServerError(rw)
-			return
-		}
-
-		sumdbReq = sumdbReq.WithContext(r.Context())
-
-		sumdbRes, err := httpDo(g.httpClient, sumdbReq)
-		if err != nil {
-			if !isTimeoutError(err) {
-				g.logError(err)
-				responseInternalServerError(rw)
-				return
-			}
-
-			g.logError(err)
-			setResponseCacheControlHeader(rw, -1)
-			responseNotFound(rw, "fetch timed out")
-
-			return
-		}
-		defer sumdbRes.Body.Close()
-
-		b, err := ioutil.ReadAll(sumdbRes.Body)
-		if err != nil {
-			g.logError(err)
-			responseInternalServerError(rw)
-			return
-		}
-
-		if sumdbRes.StatusCode != http.StatusOK {
-			switch sumdbRes.StatusCode {
-			case http.StatusBadRequest,
-				http.StatusNotFound,
-				http.StatusGone:
-				g.logErrorf("%s", b)
-				setResponseCacheControlHeader(rw, 600)
-				responseNotFound(rw, string(b))
-				return
-			}
-
-			g.logError(fmt.Errorf(
-				"GET %s: %s: %s",
-				redactedURL(sumdbURL),
-				sumdbRes.Status,
-				b,
-			))
-
-			responseBadGateway(rw)
-
+			responseModError(rw, err, false)
 			return
 		}
 
 		rw.Header().Set("Content-Type", contentType)
-		rw.Header().Set("Content-Length", strconv.Itoa(len(b)))
+		rw.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
 
-		setResponseCacheControlHeader(rw, maxAge)
-
-		rw.Write(b)
+		setResponseCacheControlHeader(rw, cacheControlMaxAge)
+		buf.WriteTo(rw)
 
 		return
 	}
 
-	isLatest := false
-	isList := false
-	switch {
-	case strings.HasSuffix(name, "/@latest"):
+	var isLatest, isList bool
+	if isLatest = strings.HasSuffix(name, "/@latest"); isLatest {
 		name = fmt.Sprint(
 			strings.TrimSuffix(name, "latest"),
 			"v/latest.info",
 		)
-		isLatest = true
-	case strings.HasSuffix(name, "/@v/list"):
+	} else if isList = strings.HasSuffix(name, "/@v/list"); isList {
 		name = fmt.Sprint(
 			strings.TrimSuffix(name, "list"),
 			"latest.info",
 		)
-		isList = true
 	}
 
 	nameParts := strings.Split(name, "/@v/")
 	if len(nameParts) != 2 {
-		setResponseCacheControlHeader(rw, 86400)
-		responseNotFound(rw)
+		responseNotFound(rw, 86400)
 		return
 	}
 
 	escapedModulePath := nameParts[0]
 	modulePath, err := module.UnescapePath(escapedModulePath)
 	if err != nil {
-		setResponseCacheControlHeader(rw, 86400)
-		responseNotFound(rw)
+		responseNotFound(rw, 86400)
 		return
 	}
 
@@ -464,16 +394,14 @@ func (g *Goproxy) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	switch nameExt {
 	case ".info", ".mod", ".zip":
 	default:
-		setResponseCacheControlHeader(rw, 86400)
-		responseNotFound(rw)
+		responseNotFound(rw, 86400)
 		return
 	}
 
 	escapedModuleVersion := strings.TrimSuffix(nameBase, nameExt)
 	moduleVersion, err := module.UnescapeVersion(escapedModuleVersion)
 	if err != nil {
-		setResponseCacheControlHeader(rw, 86400)
-		responseNotFound(rw)
+		responseNotFound(rw, 86400)
 		return
 	}
 
@@ -494,28 +422,17 @@ func (g *Goproxy) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			moduleVersion,
 		)
 		if err != nil {
-			if !isNotFoundError(err) {
-				g.logError(err)
-				responseInternalServerError(rw)
-				return
-			}
-
 			g.logError(err)
-			if isTimeoutError(err) {
-				setResponseCacheControlHeader(rw, -1)
-				responseNotFound(rw, "fetch timed out")
-			} else {
-				setResponseCacheControlHeader(rw, 600)
-				responseNotFound(rw, err)
-			}
-
+			responseModError(rw, err, true)
 			return
 		}
 
-		versions := strings.Join(mr.Versions, "\n")
-
-		setResponseCacheControlHeader(rw, 300)
-		responseString(rw, http.StatusOK, versions)
+		responseString(
+			rw,
+			http.StatusOK,
+			60,
+			strings.Join(mr.Versions, "\n"),
+		)
 
 		return
 	} else if !semver.IsValid(moduleVersion) {
@@ -525,8 +442,12 @@ func (g *Goproxy) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		} else if nameExt == ".info" {
 			operation = "lookup"
 		} else {
-			setResponseCacheControlHeader(rw, 86400)
-			responseNotFound(rw, "unrecognized version")
+			responseNotFound(rw, 86400, fmt.Sprintf(
+				"%s@%s: invalid version: unknown revision %s",
+				modulePath,
+				moduleVersion,
+				moduleVersion,
+			))
 			return
 		}
 
@@ -538,413 +459,223 @@ func (g *Goproxy) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 			moduleVersion,
 		)
 		if err != nil {
-			if !isNotFoundError(err) {
-				g.logError(err)
-				responseInternalServerError(rw)
-				return
-			}
-
 			g.logError(err)
-			if isTimeoutError(err) {
-				setResponseCacheControlHeader(rw, -1)
-				responseNotFound(rw, "fetch timed out")
-			} else {
-				setResponseCacheControlHeader(rw, 600)
-				responseNotFound(rw, err)
-			}
-
+			responseModError(rw, err, true)
 			return
 		}
 
-		mr.Versions = nil
-		mr.Info = ""
-		mr.GoMod = ""
-		mr.Zip = ""
-
-		b, err := json.Marshal(mr)
+		b, err := json.Marshal(struct {
+			Version string
+			Time    time.Time
+		}{
+			mr.Version,
+			mr.Time,
+		})
 		if err != nil {
 			g.logError(err)
 			responseInternalServerError(rw)
 			return
 		}
 
-		setResponseCacheControlHeader(rw, 300)
-		responseJSON(rw, http.StatusOK, b)
+		responseJSON(rw, http.StatusOK, 60, b)
 
 		return
 	}
 
-	cache, err := g.cache(r.Context(), name)
-	if err == ErrCacheNotFound {
+	var content io.Reader
+	if rc, err := g.cache(r.Context(), name); err == nil {
+		defer rc.Close()
+		content = rc
+	} else if errors.Is(err, os.ErrNotExist) {
 		mr, err := g.mod(
 			r.Context(),
-			"download",
+			fmt.Sprint("download ", nameExt[1:]),
 			goproxyRoot,
 			modulePath,
 			moduleVersion,
 		)
 		if err != nil {
-			if !isNotFoundError(err) {
-				g.logError(err)
-				responseInternalServerError(rw)
-				return
-			}
-
 			g.logError(err)
-			if isTimeoutError(err) {
-				setResponseCacheControlHeader(rw, -1)
-				responseNotFound(rw, "fetch timed out")
-			} else {
-				setResponseCacheControlHeader(rw, 600)
-				responseNotFound(rw, err)
-			}
-
+			responseModError(rw, err, false)
 			return
-		}
-
-		if g.goBinEnv["GOSUMDB"] != "off" &&
-			!globsMatchPath(g.goBinEnv["GONOSUMDB"], modulePath) {
-			zipLines, err := g.sumdbClient.Lookup(
-				modulePath,
-				moduleVersion,
-			)
-			if err != nil {
-				trimmedError := errors.New(strings.TrimPrefix(
-					err.Error(),
-					fmt.Sprintf(
-						"%s@%s: ",
-						modulePath,
-						moduleVersion,
-					),
-				))
-
-				if !isNotFoundError(err) {
-					g.logError(trimmedError)
-					responseInternalServerError(rw)
-					return
-				}
-
-				g.logError(trimmedError)
-				if isTimeoutError(err) {
-					setResponseCacheControlHeader(rw, -1)
-					responseNotFound(rw, "fetch timed out")
-				} else {
-					setResponseCacheControlHeader(rw, 600)
-					responseNotFound(rw, trimmedError)
-				}
-
-				return
-			}
-
-			zipHash, err := dirhash.HashZip(
-				mr.Zip,
-				dirhash.DefaultHash,
-			)
-			if err != nil {
-				g.logError(err)
-				responseInternalServerError(rw)
-				return
-			}
-
-			if !stringSliceContains(
-				zipLines,
-				fmt.Sprintf(
-					"%s %s %s",
-					modulePath,
-					moduleVersion,
-					zipHash,
-				),
-			) {
-				setResponseCacheControlHeader(rw, 86400)
-				responseNotFound(rw, fmt.Sprintf(
-					"untrusted revision %s",
-					moduleVersion,
-				))
-				return
-			}
-
-			modLines, err := g.sumdbClient.Lookup(
-				modulePath,
-				fmt.Sprint(moduleVersion, "/go.mod"),
-			)
-			if err != nil {
-				trimmedError := errors.New(strings.TrimPrefix(
-					err.Error(),
-					fmt.Sprintf(
-						"%s@%s: ",
-						modulePath,
-						moduleVersion,
-					),
-				))
-
-				if !isNotFoundError(err) {
-					g.logError(trimmedError)
-					responseInternalServerError(rw)
-					return
-				}
-
-				g.logError(trimmedError)
-				if isTimeoutError(err) {
-					setResponseCacheControlHeader(rw, -1)
-					responseNotFound(rw, "fetch timed out")
-				} else {
-					setResponseCacheControlHeader(rw, 600)
-					responseNotFound(rw, trimmedError)
-				}
-
-				return
-			}
-
-			modHash, err := dirhash.Hash1(
-				[]string{"go.mod"},
-				func(string) (io.ReadCloser, error) {
-					return os.Open(mr.GoMod)
-				},
-			)
-			if err != nil {
-				g.logError(err)
-				responseInternalServerError(rw)
-				return
-			}
-
-			if !stringSliceContains(
-				modLines,
-				fmt.Sprintf(
-					"%s %s/go.mod %s",
-					modulePath,
-					moduleVersion,
-					modHash,
-				),
-			) {
-				setResponseCacheControlHeader(rw, 86400)
-				responseNotFound(rw, fmt.Sprintf(
-					"untrusted revision %s",
-					moduleVersion,
-				))
-				return
-			}
 		}
 
 		namePrefix := strings.TrimSuffix(name, nameExt)
 
-		// Using a new `context.Context` instead of the `r.Context` to
-		// avoid early timeouts.
-		ctx, cancel := context.WithTimeout(
-			context.Background(),
-			10*time.Minute,
-		)
-		defer cancel()
+		if mr.Info != "" {
+			infoFile, err := os.Open(mr.Info)
+			if err != nil {
+				g.logError(err)
+				responseInternalServerError(rw)
+				return
+			}
+			defer infoFile.Close()
 
-		var newHash func() hash.Hash
-		if g.Cacher != nil {
-			newHash = g.Cacher.NewHash
+			if err := g.setCache(
+				r.Context(),
+				fmt.Sprint(namePrefix, ".info"),
+				infoFile,
+			); err != nil {
+				g.logError(err)
+				responseInternalServerError(rw)
+				return
+			}
+		}
+
+		if mr.GoMod != "" {
+			modFile, err := os.Open(mr.GoMod)
+			if err != nil {
+				g.logError(err)
+				responseInternalServerError(rw)
+				return
+			}
+			defer modFile.Close()
+
+			if err := g.setCache(
+				r.Context(),
+				fmt.Sprint(namePrefix, ".mod"),
+				modFile,
+			); err != nil {
+				g.logError(err)
+				responseInternalServerError(rw)
+				return
+			}
+		}
+
+		if mr.Zip != "" {
+			zipFile, err := os.Open(mr.Zip)
+			if err != nil {
+				g.logError(err)
+				responseInternalServerError(rw)
+				return
+			}
+			defer zipFile.Close()
+
+			if err := g.setCache(
+				r.Context(),
+				fmt.Sprint(namePrefix, ".zip"),
+				zipFile,
+			); err != nil {
+				g.logError(err)
+				responseInternalServerError(rw)
+				return
+			}
+		}
+
+		if dc, ok := g.Cacher.(DirCacher); ok {
+			rc, err := dc.Get(r.Context(), name)
+			if err != nil {
+				g.logError(err)
+				responseInternalServerError(rw)
+				return
+			}
+			defer rc.Close()
+
+			content = rc
 		} else {
-			newHash = md5.New
-		}
+			switch nameExt {
+			case ".info":
+				content, err = os.Open(mr.Info)
+			case ".mod":
+				content, err = os.Open(mr.GoMod)
+			case ".zip":
+				content, err = os.Open(mr.Zip)
+			}
 
-		infoCache, err := newTempCache(
-			mr.Info,
-			fmt.Sprint(namePrefix, ".info"),
-			newHash(),
-		)
-		if err != nil {
-			g.logError(err)
-			return
+			if err != nil {
+				g.logError(err)
+				responseInternalServerError(rw)
+				return
+			}
+			defer content.(*os.File).Close()
 		}
-		defer infoCache.Close()
-
-		if err := g.setCache(ctx, infoCache); err != nil {
-			g.logError(err)
-			return
-		}
-
-		modCache, err := newTempCache(
-			mr.GoMod,
-			fmt.Sprint(namePrefix, ".mod"),
-			newHash(),
-		)
-		if err != nil {
-			g.logError(err)
-			return
-		}
-		defer modCache.Close()
-
-		if err := g.setCache(ctx, modCache); err != nil {
-			g.logError(err)
-			return
-		}
-
-		zipCache, err := newTempCache(
-			mr.Zip,
-			fmt.Sprint(namePrefix, ".zip"),
-			newHash(),
-		)
-		if err != nil {
-			g.logError(err)
-			return
-		}
-		defer zipCache.Close()
-
-		if err := g.setCache(ctx, zipCache); err != nil {
-			g.logError(err)
-			return
-		}
-
-		var filename string
-		switch nameExt {
-		case ".info":
-			filename = mr.Info
-		case ".mod":
-			filename = mr.GoMod
-		case ".zip":
-			filename = mr.Zip
-		}
-
-		cache, err = newTempCache(filename, name, newHash())
-		if err != nil {
-			g.logError(err)
-			responseInternalServerError(rw)
-			return
-		}
-	} else if err != nil {
-		if !isTimeoutError(err) {
-			g.logError(err)
-			responseInternalServerError(rw)
-			return
-		}
-
+	} else {
 		g.logError(err)
-		setResponseCacheControlHeader(rw, -1)
-		responseNotFound(rw, "fetch timed out")
-
+		responseModError(rw, err, false)
 		return
 	}
-	defer cache.Close()
 
-	rw.Header().Set("Content-Type", cache.MIMEType())
-	rw.Header().Set("ETag", fmt.Sprintf(
-		"%q",
-		base64.StdEncoding.EncodeToString(cache.Checksum()),
-	))
+	var contentType string
+	switch nameExt {
+	case ".info":
+		contentType = "application/json; charset=utf-8"
+	case ".mod":
+		contentType = "text/plain; charset=utf-8"
+	case ".zip":
+		contentType = "application/zip"
+	}
+
+	rw.Header().Set("Content-Type", contentType)
+
+	var modTime time.Time
+	if mt, ok := content.(interface{ ModTime() time.Time }); ok {
+		modTime = mt.ModTime()
+	}
+
+	if cs, ok := content.(interface{ Checksum() []byte }); ok {
+		rw.Header().Set("ETag", fmt.Sprintf(
+			"%q",
+			base64.StdEncoding.EncodeToString(cs.Checksum()),
+		))
+	}
 
 	setResponseCacheControlHeader(rw, 604800)
-	http.ServeContent(rw, r, "", cache.ModTime(), cache)
-}
-
-// cache returns the matched `Cache` for the name from the `Cacher` of the g.
-func (g *Goproxy) cache(ctx context.Context, name string) (Cache, error) {
-	if g.Cacher == nil {
-		return nil, ErrCacheNotFound
-	}
-
-	return g.Cacher.Cache(ctx, name)
-}
-
-// setCache sets the c to the `Cacher` of the g.
-func (g *Goproxy) setCache(ctx context.Context, c Cache) error {
-	if g.Cacher == nil {
-		return nil
-	}
-
-	if g.CacherMaxCacheBytes != 0 &&
-		c.Size() > int64(g.CacherMaxCacheBytes) {
-		return nil
-	}
-
-	return g.Cacher.SetCache(ctx, c)
-}
-
-// logErrorf logs the v as an error in the format.
-func (g *Goproxy) logErrorf(format string, v ...interface{}) {
-	s := fmt.Sprintf(format, v...)
-	if g.ErrorLogger != nil {
-		g.ErrorLogger.Output(2, s)
+	if contentRS, ok := content.(io.ReadSeeker); ok {
+		http.ServeContent(rw, r, "", modTime, contentRS)
 	} else {
-		log.Output(2, s)
-	}
-}
-
-// logError logs the err.
-func (g *Goproxy) logError(err error) {
-	g.logErrorf("%v", err)
-}
-
-// notFoundError is an error indicating that something was not found.
-type notFoundError error
-
-// isNotFoundError reports whether the err means something was not found.
-func isNotFoundError(err error) bool {
-	_, ok := err.(notFoundError)
-	return ok || isTimeoutError(err)
-}
-
-// isTimeoutError reports whether the err means an operation has timed out.
-func isTimeoutError(err error) bool {
-	if ue, ok := err.(*url.Error); ok && ue.Timeout() {
-		return true
-	}
-
-	return err == context.DeadlineExceeded
-}
-
-// parseRawURL parses the rawURL.
-func parseRawURL(rawURL string) (*url.URL, error) {
-	if strings.ContainsAny(rawURL, ".:/") &&
-		!strings.Contains(rawURL, ":/") &&
-		!filepath.IsAbs(rawURL) &&
-		!path.IsAbs(rawURL) {
-		rawURL = fmt.Sprint("https://", rawURL)
-	}
-
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return nil, err
-	}
-
-	switch strings.ToLower(u.Scheme) {
-	case "http", "https":
-	default:
-		return nil, fmt.Errorf(
-			"invalid URL scheme (must be http or https): %s",
-			redactedURL(u),
-		)
-	}
-
-	return u, nil
-}
-
-// appendURL appends the extraPaths to the u safely and reutrns a new instance
-// of the `url.URL`.
-func appendURL(u *url.URL, extraPaths ...string) *url.URL {
-	nu := *u
-	u = &nu
-	for _, ep := range extraPaths {
-		u.Path = path.Join(u.Path, ep)
-		u.RawPath = path.Join(
-			u.RawPath,
-			strings.Replace(url.PathEscape(ep), "%2F", "/", -1),
-		)
-	}
-
-	return u
-}
-
-// redactedURL returns a redacted string form of the u, suitable for printing in
-// error messages. The string form replaces any non-empty password in the u with
-// "[redacted]".
-func redactedURL(u *url.URL) string {
-	if u.User != nil {
-		if _, ok := u.User.Password(); ok {
-			nu := *u
-			u = &nu
-			u.User = url.UserPassword(
-				u.User.Username(),
-				"[redacted]",
+		if !modTime.IsZero() {
+			rw.Header().Set(
+				"Last-Modified",
+				modTime.UTC().Format(http.TimeFormat),
 			)
+		}
+
+		io.Copy(rw, content)
+	}
+}
+
+// cache returns the matched cache for the name from the `Cacher` of the g.
+func (g *Goproxy) cache(
+	ctx context.Context,
+	name string,
+) (io.ReadCloser, error) {
+	if g.Cacher == nil {
+		return nil, os.ErrNotExist
+	}
+
+	return g.Cacher.Get(ctx, name)
+}
+
+// setCache sets the content as a cache with the name to the `Cacher` of the g.
+func (g *Goproxy) setCache(
+	ctx context.Context,
+	name string,
+	content io.ReadSeeker,
+) error {
+	if g.Cacher == nil {
+		return nil
+	}
+
+	if g.CacherMaxCacheBytes != 0 {
+		if size, err := content.Seek(0, io.SeekEnd); err != nil {
+			return err
+		} else if size > int64(g.CacherMaxCacheBytes) {
+			return nil
+		} else if _, err := content.Seek(0, io.SeekStart); err != nil {
+			return err
 		}
 	}
 
-	return u.String()
+	return g.Cacher.Set(ctx, name, content)
+}
+
+// logError logs the v as an error.
+func (g *Goproxy) logError(v ...interface{}) {
+	if g.ErrorLogger != nil {
+		g.ErrorLogger.Output(2, fmt.Sprint(v...))
+	} else {
+		log.Output(2, fmt.Sprint(v...))
+	}
 }
 
 // stringSliceContains reports whether the ss contains the s.

@@ -1,7 +1,7 @@
 package goproxy
 
 import (
-	"archive/zip"
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -9,26 +9,28 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"sort"
 	"strings"
 	"time"
 
-	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
+	"golang.org/x/mod/sumdb"
+	"golang.org/x/mod/sumdb/dirhash"
+	"golang.org/x/mod/zip"
 )
 
-// modResult is an unified result of the `mod`.
+// modResult is an unified result for the `Goproxy.mod`.
 type modResult struct {
-	Version  string    `json:",omitempty"`
-	Time     time.Time `json:",omitempty"`
-	Versions []string  `json:",omitempty"`
-	Info     string    `json:",omitempty"`
-	GoMod    string    `json:",omitempty"`
-	Zip      string    `json:",omitempty"`
+	Version  string
+	Time     time.Time
+	Versions []string
+	Info     string
+	GoMod    string
+	Zip      string
 }
 
 // mod executes the Go modules related commands based on the operation.
@@ -40,7 +42,12 @@ func (g *Goproxy) mod(
 	moduleVersion string,
 ) (*modResult, error) {
 	switch operation {
-	case "lookup", "latest", "list", "download":
+	case "lookup",
+		"latest",
+		"list",
+		"download info",
+		"download mod",
+		"download zip":
 	default:
 		return nil, errors.New("invalid mod operation")
 	}
@@ -55,165 +62,154 @@ func (g *Goproxy) mod(
 		return nil, err
 	}
 
+	verify := g.goBinEnv["GOSUMDB"] != "off" &&
+		!globsMatchPath(g.goBinEnv["GONOSUMDB"], modulePath)
+
 	// Try proxies.
 
-	var (
-		tryDirect    bool
-		proxies      []string
-		lastNotFound string
-	)
+	tryDirect := globsMatchPath(g.goBinEnv["GONOPROXY"], modulePath)
 
-	if globsMatchPath(g.goBinEnv["GONOPROXY"], modulePath) {
-		tryDirect = true
-	} else {
-		proxies = strings.Split(g.goBinEnv["GOPROXY"], ",")
-	}
+	var proxyError error
+	for goproxy := g.goBinEnv["GOPROXY"]; goproxy != "" && !tryDirect; {
+		var (
+			proxy           string
+			fallBackOnError bool
+		)
 
-	for _, proxy := range proxies {
-		if proxy == "direct" {
-			tryDirect = true
-			break
+		if i := strings.IndexAny(goproxy, ",|"); i >= 0 {
+			proxy = goproxy[:i]
+			fallBackOnError = goproxy[i] == '|'
+			goproxy = goproxy[i+1:]
+		} else {
+			proxy = goproxy
+			goproxy = ""
 		}
 
-		if proxy == "off" {
+		switch proxy {
+		case "direct":
+			tryDirect = true
+			continue
+		case "off":
 			return nil, errors.New("disabled by GOPROXY=off")
 		}
 
 		proxyURL, err := parseRawURL(proxy)
 		if err != nil {
+			if fallBackOnError {
+				proxyError = err
+				continue
+			}
+
 			return nil, err
 		}
 
 		switch operation {
 		case "lookup", "latest":
-			var req *http.Request
+			var operationURL *url.URL
 			if operation == "lookup" {
-				req, err = http.NewRequest(
-					http.MethodGet,
-					appendURL(
-						proxyURL,
-						escapedModulePath,
-						"@v",
-						fmt.Sprint(
-							escapedModuleVersion,
-							".info",
-						),
-					).String(),
-					nil,
+				operationURL = appendURL(
+					proxyURL,
+					escapedModulePath,
+					"@v",
+					fmt.Sprint(
+						escapedModuleVersion,
+						".info",
+					),
 				)
 			} else {
-				req, err = http.NewRequest(
-					http.MethodGet,
-					appendURL(
-						proxyURL,
-						escapedModulePath,
-						"@latest",
-					).String(),
-					nil,
+				operationURL = appendURL(
+					proxyURL,
+					escapedModulePath,
+					"@latest",
 				)
 			}
 
-			if err != nil {
+			var buf bytes.Buffer
+			if err := httpGet(
+				ctx,
+				g.httpClient,
+				operationURL.String(),
+				&buf,
+			); err != nil {
+				if fallBackOnError ||
+					errors.Is(err, errNotFound) {
+					proxyError = err
+					continue
+				}
+
 				return nil, err
-			}
-
-			req = req.WithContext(ctx)
-
-			res, err := httpDo(g.httpClient, req)
-			if err != nil {
-				return nil, err
-			}
-			defer res.Body.Close()
-
-			b, err := ioutil.ReadAll(res.Body)
-			if err != nil {
-				return nil, err
-			}
-
-			switch res.StatusCode {
-			case http.StatusOK:
-			case http.StatusNotFound, http.StatusGone:
-				lastNotFound = string(b)
-				continue
-			default:
-				return nil, fmt.Errorf(
-					"GET %s: %s: %s",
-					redactedURL(req.URL),
-					res.Status,
-					b,
-				)
 			}
 
 			mr := modResult{}
-			if err := json.Unmarshal(b, &mr); err != nil {
-				return nil, err
+			if err := json.Unmarshal(buf.Bytes(), &mr); err != nil {
+				proxyError = notFoundError(fmt.Sprintf(
+					"invalid info response: %v",
+					err,
+				))
+				continue
 			}
+
+			if !semver.IsValid(mr.Version) || mr.Time.IsZero() {
+				proxyError = notFoundError(
+					"invalid info response",
+				)
+				continue
+			}
+
+			mr.Time = mr.Time.UTC()
 
 			return &mr, nil
 		case "list":
-			req, err := http.NewRequest(
-				http.MethodGet,
+			var buf bytes.Buffer
+			if err := httpGet(
+				ctx,
+				g.httpClient,
 				appendURL(
 					proxyURL,
 					escapedModulePath,
 					"@v",
 					"list",
 				).String(),
-				nil,
-			)
-			if err != nil {
-				return nil, err
-			}
-
-			req = req.WithContext(ctx)
-
-			res, err := httpDo(g.httpClient, req)
-			if err != nil {
-				return nil, err
-			}
-			defer res.Body.Close()
-
-			b, err := ioutil.ReadAll(res.Body)
-			if err != nil {
-				return nil, err
-			}
-
-			switch res.StatusCode {
-			case http.StatusOK:
-			case http.StatusNotFound, http.StatusGone:
-				lastNotFound = string(b)
-				continue
-			default:
-				return nil, fmt.Errorf(
-					"GET %s: %s: %s",
-					redactedURL(req.URL),
-					res.Status,
-					b,
-				)
-			}
-
-			versions := []string{}
-			for _, b := range bytes.Split(b, []byte{'\n'}) {
-				if len(b) == 0 {
+				&buf,
+			); err != nil {
+				if fallBackOnError ||
+					errors.Is(err, errNotFound) {
+					proxyError = err
 					continue
 				}
 
-				versions = append(versions, string(b))
+				return nil, err
 			}
 
-			sort.Slice(versions, func(i, j int) bool {
+			mr := modResult{}
+			for _, s := range strings.Split(buf.String(), "\n") {
+				if semver.IsValid(s) {
+					mr.Versions = append(mr.Versions, s)
+				}
+			}
+
+			sort.Slice(mr.Versions, func(i, j int) bool {
 				return semver.Compare(
-					versions[i],
-					versions[j],
+					mr.Versions[i],
+					mr.Versions[j],
 				) < 0
 			})
 
-			return &modResult{
-				Versions: versions,
-			}, nil
-		case "download":
-			infoFileReq, err := http.NewRequest(
-				http.MethodGet,
+			return &mr, nil
+		case "download info":
+			infoFile, err := ioutil.TempFile(goproxyRoot, "info")
+			if err != nil {
+				if fallBackOnError {
+					proxyError = err
+					continue
+				}
+
+				return nil, err
+			}
+
+			if err := httpGet(
+				ctx,
+				g.httpClient,
 				appendURL(
 					proxyURL,
 					escapedModulePath,
@@ -223,62 +219,56 @@ func (g *Goproxy) mod(
 						".info",
 					),
 				).String(),
-				nil,
-			)
-			if err != nil {
-				return nil, err
-			}
-
-			infoFileReq = infoFileReq.WithContext(ctx)
-
-			infoFileRes, err := httpDo(g.httpClient, infoFileReq)
-			if err != nil {
-				return nil, err
-			}
-			defer infoFileRes.Body.Close()
-
-			if infoFileRes.StatusCode != http.StatusOK {
-				b, err := ioutil.ReadAll(infoFileRes.Body)
-				if err != nil {
-					return nil, err
-				}
-
-				switch infoFileRes.StatusCode {
-				case http.StatusNotFound, http.StatusGone:
-					lastNotFound = string(b)
+				infoFile,
+			); err != nil {
+				if fallBackOnError ||
+					errors.Is(err, errNotFound) {
+					proxyError = err
 					continue
 				}
 
-				return nil, fmt.Errorf(
-					"GET %s: %s: %s",
-					redactedURL(infoFileReq.URL),
-					infoFileRes.Status,
-					b,
-				)
-			}
-
-			infoFile, err := ioutil.TempFile(goproxyRoot, "info")
-			if err != nil {
-				return nil, err
-			}
-
-			if _, err := io.Copy(
-				infoFile,
-				infoFileRes.Body,
-			); err != nil {
 				return nil, err
 			}
 
 			if err := infoFile.Close(); err != nil {
+				if fallBackOnError {
+					proxyError = err
+					continue
+				}
+
 				return nil, err
 			}
 
-			if err := checkInfoFile(infoFile.Name()); err != nil {
+			if _, err := checkAndFormatInfoFile(
+				infoFile.Name(),
+				"",
+			); err != nil {
+				if fallBackOnError ||
+					errors.Is(err, errNotFound) {
+					proxyError = err
+					continue
+				}
+
 				return nil, err
 			}
 
-			modFileReq, err := http.NewRequest(
-				http.MethodGet,
+			return &modResult{
+				Info: infoFile.Name(),
+			}, nil
+		case "download mod":
+			modFile, err := ioutil.TempFile(goproxyRoot, "mod")
+			if err != nil {
+				if fallBackOnError {
+					proxyError = err
+					continue
+				}
+
+				return nil, err
+			}
+
+			if err := httpGet(
+				ctx,
+				g.httpClient,
 				appendURL(
 					proxyURL,
 					escapedModulePath,
@@ -288,62 +278,70 @@ func (g *Goproxy) mod(
 						".mod",
 					),
 				).String(),
-				nil,
-			)
-			if err != nil {
-				return nil, err
-			}
-
-			modFileReq = modFileReq.WithContext(ctx)
-
-			modFileRes, err := httpDo(g.httpClient, modFileReq)
-			if err != nil {
-				return nil, err
-			}
-			defer modFileRes.Body.Close()
-
-			if modFileRes.StatusCode != http.StatusOK {
-				b, err := ioutil.ReadAll(modFileRes.Body)
-				if err != nil {
-					return nil, err
-				}
-
-				switch modFileRes.StatusCode {
-				case http.StatusNotFound, http.StatusGone:
-					lastNotFound = string(b)
+				modFile,
+			); err != nil {
+				if fallBackOnError ||
+					errors.Is(err, errNotFound) {
+					proxyError = err
 					continue
 				}
 
-				return nil, fmt.Errorf(
-					"GET %s: %s: %s",
-					redactedURL(modFileReq.URL),
-					modFileRes.Status,
-					b,
-				)
-			}
-
-			modFile, err := ioutil.TempFile(goproxyRoot, "mod")
-			if err != nil {
-				return nil, err
-			}
-
-			if _, err := io.Copy(
-				modFile,
-				modFileRes.Body,
-			); err != nil {
 				return nil, err
 			}
 
 			if err := modFile.Close(); err != nil {
+				if fallBackOnError {
+					proxyError = err
+					continue
+				}
+
 				return nil, err
 			}
 
 			if err := checkModFile(modFile.Name()); err != nil {
+				if fallBackOnError ||
+					errors.Is(err, errNotFound) {
+					proxyError = err
+					continue
+				}
+
 				return nil, err
 			}
 
-			zipFileReq, err := http.NewRequest(
-				http.MethodGet,
+			if verify {
+				if err := verifyModFile(
+					g.sumdbClient,
+					modFile.Name(),
+					modulePath,
+					moduleVersion,
+				); err != nil {
+					if fallBackOnError ||
+						errors.Is(err, errNotFound) {
+						proxyError = err
+						continue
+					}
+
+					return nil, err
+				}
+			}
+
+			return &modResult{
+				GoMod: modFile.Name(),
+			}, nil
+		case "download zip":
+			zipFile, err := ioutil.TempFile(goproxyRoot, "zip")
+			if err != nil {
+				if fallBackOnError {
+					proxyError = err
+					continue
+				}
+
+				return nil, err
+			}
+
+			if err := httpGet(
+				ctx,
+				g.httpClient,
 				appendURL(
 					proxyURL,
 					escapedModulePath,
@@ -353,77 +351,74 @@ func (g *Goproxy) mod(
 						".zip",
 					),
 				).String(),
-				nil,
-			)
-			if err != nil {
-				return nil, err
-			}
-
-			zipFileReq = zipFileReq.WithContext(ctx)
-
-			zipFileRes, err := httpDo(g.httpClient, zipFileReq)
-			if err != nil {
-				return nil, err
-			}
-			defer zipFileRes.Body.Close()
-
-			if zipFileRes.StatusCode != http.StatusOK {
-				b, err := ioutil.ReadAll(zipFileRes.Body)
-				if err != nil {
-					return nil, err
-				}
-
-				switch zipFileRes.StatusCode {
-				case http.StatusNotFound, http.StatusGone:
-					lastNotFound = string(b)
+				zipFile,
+			); err != nil {
+				if fallBackOnError ||
+					errors.Is(err, errNotFound) {
+					proxyError = err
 					continue
 				}
 
-				return nil, fmt.Errorf(
-					"GET %s: %s: %s",
-					redactedURL(zipFileReq.URL),
-					zipFileRes.Status,
-					b,
-				)
-			}
-
-			zipFile, err := ioutil.TempFile(goproxyRoot, "zip")
-			if err != nil {
-				return nil, err
-			}
-
-			if _, err := io.Copy(
-				zipFile,
-				zipFileRes.Body,
-			); err != nil {
 				return nil, err
 			}
 
 			if err := zipFile.Close(); err != nil {
+				if fallBackOnError {
+					proxyError = err
+					continue
+				}
+
 				return nil, err
 			}
 
-			if err := checkZIPFile(zipFile.Name()); err != nil {
+			if err := checkZipFile(
+				zipFile.Name(),
+				modulePath,
+				moduleVersion,
+			); err != nil {
+				if fallBackOnError ||
+					errors.Is(err, errNotFound) {
+					proxyError = err
+					continue
+				}
+
 				return nil, err
+			}
+
+			if verify {
+				if err := verifyZipFile(
+					g.sumdbClient,
+					zipFile.Name(),
+					modulePath,
+					moduleVersion,
+				); err != nil {
+					if fallBackOnError ||
+						errors.Is(err, errNotFound) {
+						proxyError = err
+						continue
+					}
+
+					return nil, err
+				}
 			}
 
 			return &modResult{
-				Info:  infoFile.Name(),
-				GoMod: modFile.Name(),
-				Zip:   zipFile.Name(),
+				Zip: zipFile.Name(),
 			}, nil
 		}
 	}
 
 	if !tryDirect {
-		if lastNotFound == "" {
-			lastNotFound = fmt.Sprintf(
-				"unknown revision %s",
-				moduleVersion,
-			)
+		if proxyError != nil {
+			return nil, proxyError
 		}
 
-		return nil, notFoundError(errors.New(lastNotFound))
+		return nil, notFoundError(fmt.Sprintf(
+			"%s@%s: invalid version: unknown revision %s",
+			modulePath,
+			moduleVersion,
+			moduleVersion,
+		))
 	}
 
 	// Try direct.
@@ -452,7 +447,7 @@ func (g *Goproxy) mod(
 			"-versions",
 			fmt.Sprint(modulePath, "@", moduleVersion),
 		}
-	case "download":
+	case "download info", "download mod", "download zip":
 		args = []string{
 			"mod",
 			"download",
@@ -461,7 +456,7 @@ func (g *Goproxy) mod(
 		}
 	}
 
-	cmd := exec.CommandContext(ctx, g.GoBinName, args...)
+	cmd := exec.CommandContext(ctx, g.goBinName, args...)
 	cmd.Env = make([]string, 0, len(g.goBinEnv)+6)
 	for k, v := range g.goBinEnv {
 		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
@@ -480,8 +475,8 @@ func (g *Goproxy) mod(
 	cmd.Dir = goproxyRoot
 	stdout, err := cmd.Output()
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return nil, context.DeadlineExceeded
+		if err := ctx.Err(); errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("command %v: %w", cmd.Args, err)
 		}
 
 		output := stdout
@@ -513,7 +508,7 @@ func (g *Goproxy) mod(
 		errorMessage = strings.TrimPrefix(errorMessage, "go list -m: ")
 		errorMessage = strings.TrimRight(errorMessage, "\n")
 
-		return nil, notFoundError(errors.New(errorMessage))
+		return nil, notFoundError(errorMessage)
 	}
 
 	mr := modResult{}
@@ -521,53 +516,237 @@ func (g *Goproxy) mod(
 		return nil, err
 	}
 
+	switch operation {
+	case "lookup", "latest":
+		mr.Time = mr.Time.UTC()
+	case "list":
+		sort.Slice(mr.Versions, func(i, j int) bool {
+			return semver.Compare(
+				mr.Versions[i],
+				mr.Versions[j],
+			) < 0
+		})
+	case "download info", "download mod", "download zip":
+		mr.Info, err = checkAndFormatInfoFile(mr.Info, goproxyRoot)
+		if err != nil {
+			return nil, err
+		}
+
+		if verify {
+			if err := verifyModFile(
+				g.sumdbClient,
+				mr.GoMod,
+				modulePath,
+				moduleVersion,
+			); err != nil {
+				return nil, err
+			}
+
+			if err := verifyZipFile(
+				g.sumdbClient,
+				mr.Zip,
+				modulePath,
+				moduleVersion,
+			); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	return &mr, nil
 }
 
-// checkInfoFile checks the info file targeted by the name.
-func checkInfoFile(name string) error {
+// checkAndFormatInfoFile checks and formats the info file targeted by the name.
+//
+// If the tempDir is not empty, a new temporary info file will be created in it.
+// Otherwise, the info file targeted by the name will be replaced.
+func checkAndFormatInfoFile(name, tempDir string) (string, error) {
+	b, err := ioutil.ReadFile(name)
+	if err != nil {
+		return "", err
+	}
+
+	var info struct {
+		Version string
+		Time    string
+	}
+
+	if err := json.Unmarshal(b, &info); err != nil {
+		return "", notFoundError(fmt.Sprintf(
+			"invalid info file: %v",
+			err,
+		))
+	}
+
+	if !semver.IsValid(info.Version) || info.Time == "" {
+		return "", notFoundError("invalid info file")
+	}
+
+	t, err := time.Parse(time.RFC3339Nano, info.Time)
+	if err != nil {
+		return "", notFoundError(fmt.Sprintf(
+			"invalid info file: %v",
+			err,
+		))
+	}
+
+	fb, err := json.Marshal(struct {
+		Version string
+		Time    time.Time
+	}{
+		Version: info.Version,
+		Time:    t.UTC(),
+	})
+	if err != nil {
+		return "", err
+	}
+
+	if bytes.Equal(fb, b) {
+		return name, nil
+	}
+
+	if tempDir != "" {
+		f, err := ioutil.TempFile(tempDir, "info")
+		if err != nil {
+			return "", err
+		}
+
+		if _, err := f.Write(fb); err != nil {
+			return "", err
+		}
+
+		if err := f.Close(); err != nil {
+			return "", err
+		}
+
+		return f.Name(), nil
+	}
+
+	fi, err := os.Stat(name)
+	if err != nil {
+		return "", err
+	}
+
+	if err := ioutil.WriteFile(name, fb, fi.Mode()); err != nil {
+		return "", err
+	}
+
+	return name, nil
+}
+
+// checkModFile checks the mod file targeted by the name.
+func checkModFile(name string) error {
 	f, err := os.Open(name)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	var info struct {
-		Version string
-		Time    time.Time
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		if strings.Contains(scanner.Text(), "module") {
+			return nil
+		}
 	}
 
-	if err := json.NewDecoder(f).Decode(&info); err != nil {
+	if err := scanner.Err(); err != nil {
+		return notFoundError(fmt.Sprintf("invalid mod file: %v", err))
+	}
+
+	return notFoundError("invalid mod file")
+}
+
+// verifyModFile uses the sumdbClient to verify the mod file targeted by the
+// name with the modulePath and moduleVersion.
+func verifyModFile(
+	sumdbClient *sumdb.Client,
+	name string,
+	modulePath string,
+	moduleVersion string,
+) error {
+	modLines, err := sumdbClient.Lookup(
+		modulePath,
+		fmt.Sprint(moduleVersion, "/go.mod"),
+	)
+	if err != nil {
 		return err
 	}
 
-	if !semver.IsValid(info.Version) || info.Time.IsZero() {
-		return notFoundError(errors.New("invalid info file"))
+	modHash, err := dirhash.Hash1(
+		[]string{"go.mod"},
+		func(string) (io.ReadCloser, error) {
+			return os.Open(name)
+		},
+	)
+	if err != nil {
+		return err
+	}
+
+	if !stringSliceContains(
+		modLines,
+		fmt.Sprintf(
+			"%s %s/go.mod %s",
+			modulePath,
+			moduleVersion,
+			modHash,
+		),
+	) {
+		return notFoundError(fmt.Sprintf(
+			"%s@%s: invalid version: untrusted revision %s",
+			modulePath,
+			moduleVersion,
+			moduleVersion,
+		))
 	}
 
 	return nil
 }
 
-// checkModFile checks the mod file targeted by the name.
-func checkModFile(name string) error {
-	b, err := ioutil.ReadFile(name)
-	if err != nil {
-		return err
-	}
-
-	if _, err := modfile.Parse("go.mod", b, nil); err != nil {
-		return notFoundError(fmt.Errorf("invalid mod file: %v", err))
+// checkZipFile checks the zip file targeted by the name with the modulePath and
+// moduleVersion.
+func checkZipFile(name, modulePath, moduleVersion string) error {
+	if _, err := zip.CheckZip(
+		module.Version{
+			Path:    modulePath,
+			Version: moduleVersion,
+		},
+		name,
+	); err != nil {
+		return notFoundError(fmt.Sprintf("invalid zip file: %v", err))
 	}
 
 	return nil
 }
 
-// checkZIPFile checks the ZIP file targeted by the name.
-func checkZIPFile(name string) error {
-	rc, err := zip.OpenReader(name)
+// verifyZipFile uses the sumdbClient to verify the zip file targeted by the
+// name with the modulePath and moduleVersion.
+func verifyZipFile(
+	sumdbClient *sumdb.Client,
+	name string,
+	modulePath string,
+	moduleVersion string,
+) error {
+	zipLines, err := sumdbClient.Lookup(modulePath, moduleVersion)
 	if err != nil {
-		return notFoundError(fmt.Errorf("invalid zip file: %v", err))
+		return err
 	}
 
-	return rc.Close()
+	zipHash, err := dirhash.HashZip(name, dirhash.DefaultHash)
+	if err != nil {
+		return err
+	}
+
+	if !stringSliceContains(
+		zipLines,
+		fmt.Sprintf("%s %s %s", modulePath, moduleVersion, zipHash),
+	) {
+		return notFoundError(fmt.Sprintf(
+			"%s@%s: invalid version: untrusted revision %s",
+			modulePath,
+			moduleVersion,
+			moduleVersion,
+		))
+	}
+
+	return nil
 }
