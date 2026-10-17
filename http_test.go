@@ -1,0 +1,1902 @@
+package goproxy
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"maps"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"testing/iotest"
+	"testing/synctest"
+	"time"
+)
+
+func TestHTTPGet(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		ctxTimeout    time.Duration
+		clientTimeout time.Duration
+		handler       http.HandlerFunc
+		configServer  func(server *httptest.Server)
+		wantContent   string
+		wantErr       func(serverURL string) error
+	}{
+		{
+			name:        "Success",
+			handler:     func(rw http.ResponseWriter, req *http.Request) { fmt.Fprint(rw, "foobar") },
+			wantContent: "foobar",
+		},
+		{
+			name: "NotFound",
+			handler: func(rw http.ResponseWriter, req *http.Request) {
+				rw.WriteHeader(http.StatusNotFound)
+				fmt.Fprint(rw, "not found")
+			},
+			wantErr: func(_ string) error { return fs.ErrNotExist },
+		},
+		{
+			name: "InternalServerError",
+			handler: func(rw http.ResponseWriter, req *http.Request) {
+				rw.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprint(rw, "internal server error")
+			},
+			wantErr: func(_ string) error { return errBadUpstream },
+		},
+		{
+			name: "GatewayTimeout",
+			handler: func(rw http.ResponseWriter, req *http.Request) {
+				rw.WriteHeader(http.StatusGatewayTimeout)
+				fmt.Fprint(rw, "gateway timeout")
+			},
+			wantErr: func(_ string) error { return errFetchTimedOut },
+		},
+		{
+			name: "NotImplemented",
+			handler: func(rw http.ResponseWriter, req *http.Request) {
+				rw.WriteHeader(http.StatusNotImplemented)
+				fmt.Fprint(rw, "not implemented")
+			},
+			wantErr: func(serverURL string) error {
+				return fmt.Errorf("GET %s: 501 Not Implemented: not implemented", serverURL)
+			},
+		},
+		{
+			name:       "ContextDeadline",
+			ctxTimeout: 50 * time.Millisecond,
+			handler: func(rw http.ResponseWriter, req *http.Request) {
+				<-req.Context().Done()
+			},
+			wantErr: func(_ string) error { return context.DeadlineExceeded },
+		},
+		{
+			name:       "ContextCanceled",
+			ctxTimeout: -1,
+			handler: func(rw http.ResponseWriter, req *http.Request) {
+				rw.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprint(rw, "internal server error")
+			},
+			wantErr: func(_ string) error { return context.Canceled },
+		},
+		{
+			name: "TruncatedErrorBody",
+			handler: func(rw http.ResponseWriter, req *http.Request) {
+				rw.WriteHeader(http.StatusInternalServerError)
+				rw.(http.Flusher).Flush()
+			},
+			configServer: func(server *httptest.Server) {
+				handler := server.Config.Handler
+				server.Config.Handler = http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+					handler.ServeHTTP(rw, req)
+					server.CloseClientConnections()
+				})
+			},
+			wantErr: func(_ string) error { return io.ErrUnexpectedEOF },
+		},
+		{
+			name:          "ClientTimeout",
+			clientTimeout: 50 * time.Millisecond,
+			handler: func(rw http.ResponseWriter, req *http.Request) {
+				<-req.Context().Done()
+			},
+			wantErr: func(_ string) error { return context.DeadlineExceeded },
+		},
+		{
+			name:        "LargeResponse",
+			handler:     func(rw http.ResponseWriter, req *http.Request) { io.WriteString(rw, strings.Repeat("x", 8<<10)) },
+			wantContent: strings.Repeat("x", 8<<10),
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			switch tt.ctxTimeout {
+			case 0:
+			case -1:
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			default:
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, tt.ctxTimeout)
+				defer cancel()
+			}
+
+			client := http.DefaultClient
+			if tt.clientTimeout > 0 {
+				client2 := *client
+				client2.Timeout = tt.clientTimeout
+				client = &client2
+			}
+
+			server := newHTTPTestServer(t, tt.handler)
+			if tt.configServer != nil {
+				tt.configServer(server)
+			}
+
+			var wantErr error
+			if tt.wantErr != nil {
+				wantErr = tt.wantErr(server.URL)
+			}
+
+			var content bytes.Buffer
+			header, err := httpGet(ctx, client, server.URL, &content)
+			if wantErr != nil {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				if header != nil {
+					t.Errorf("got header %v, want nil", header)
+				}
+				if got, want := err, wantErr; !compareErrors(got, want) {
+					t.Errorf("got %v, want %v", got, want)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error %v", err)
+				}
+				if got, want := content.String(), tt.wantContent; got != want {
+					t.Errorf("got %q, want %q", got, want)
+				}
+			}
+		})
+	}
+
+	t.Run("ResponseHeader", func(t *testing.T) {
+		for _, tt := range []struct {
+			name         string
+			statusCode   int
+			wantAttempts int
+		}{
+			{"Direct", http.StatusOK, 1},
+			{"Redirect", http.StatusFound, 2},
+			{"Retry", http.StatusServiceUnavailable, 2},
+			{"LastRetry", http.StatusServiceUnavailable, 3},
+		} {
+			for _, policy := range []struct {
+				name         string
+				cacheControl string
+			}{
+				{"Public", "public"},
+				{"NoStore", "no-store"},
+			} {
+				t.Run(tt.name+"/"+policy.name, func(t *testing.T) {
+					synctest.Test(t, func(t *testing.T) {
+						wantHeader := http.Header{"Cache-Control": {"max-age=60", policy.cacheControl}}
+						attempts := 0
+						client := &http.Client{Transport: httpRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+							attempts++
+							if attempts < tt.wantAttempts {
+								return &http.Response{
+									StatusCode: tt.statusCode,
+									Header: http.Header{
+										"Cache-Control": {"private"},
+										"Vary":          {"*"},
+										"Location":      {"/redirected"},
+									},
+									Body: io.NopCloser(strings.NewReader("intermediate response")),
+								}, nil
+							}
+							return &http.Response{
+								StatusCode: http.StatusOK,
+								Header:     wantHeader.Clone(),
+								Body:       io.NopCloser(strings.NewReader("foobar")),
+							}, nil
+						})}
+						var content bytes.Buffer
+						header, err := httpGet(t.Context(), client, "https://example.com", &content)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if !maps.EqualFunc(header, wantHeader, slices.Equal) {
+							t.Errorf("got header %v, want %v", header, wantHeader)
+						}
+						if got, want := content.String(), "foobar"; got != want {
+							t.Errorf("got content %q, want %q", got, want)
+						}
+						if got, want := attempts, tt.wantAttempts; got != want {
+							t.Errorf("got attempts %d, want %d", got, want)
+						}
+					})
+				})
+			}
+		}
+	})
+
+	t.Run("CopyErrors", func(t *testing.T) {
+		f, err := os.CreateTemp(t.TempDir(), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		for _, tt := range []struct {
+			name    string
+			content io.Reader
+			dst     io.Writer
+			wantErr error
+		}{
+			{"Read", iotest.ErrReader(io.ErrUnexpectedEOF), io.Discard, io.ErrUnexpectedEOF},
+			{"PartialRead", io.MultiReader(strings.NewReader("foo"), iotest.ErrReader(io.ErrUnexpectedEOF)), io.Discard, io.ErrUnexpectedEOF},
+			{"Write", strings.NewReader("foobar"), f, os.ErrClosed},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				body := &testHTTPResponseBody{Reader: tt.content}
+				client := &http.Client{Transport: httpRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Cache-Control": {"no-store"}},
+						Body:       body,
+					}, nil
+				})}
+				header, err := httpGet(t.Context(), client, "https://example.com", tt.dst)
+				if !errors.Is(err, tt.wantErr) {
+					t.Errorf("got error %v, want %v", err, tt.wantErr)
+				}
+				if header != nil {
+					t.Errorf("got header %v, want nil", header)
+				}
+				if !body.closed {
+					t.Error("response body was not closed")
+				}
+			})
+		}
+	})
+
+	t.Run("ResponseErrors", func(t *testing.T) {
+		for _, tt := range []struct {
+			name             string
+			statusCode       int
+			readErr          error
+			wantAttempts     int
+			wantErr          error
+			wantStatusCode   int
+			wantCacheControl string
+		}{
+			{"BadRequest", http.StatusBadRequest, nil, 1, nil, http.StatusInternalServerError, "no-store"},
+			{"RequestTimeout", http.StatusRequestTimeout, nil, 3, errFetchTimedOut, http.StatusNotFound, "no-store"},
+			{"RequestTimeoutReadError", http.StatusRequestTimeout, io.ErrUnexpectedEOF, 3, errFetchTimedOut, http.StatusNotFound, "no-store"},
+			{"RequestTimeoutReadNotExist", http.StatusRequestTimeout, fs.ErrNotExist, 3, errFetchTimedOut, http.StatusNotFound, "no-store"},
+			{"NotFound", http.StatusNotFound, nil, 1, fs.ErrNotExist, http.StatusNotFound, "public, max-age=60"},
+			{"Gone", http.StatusGone, nil, 1, fs.ErrNotExist, http.StatusNotFound, "public, max-age=60"},
+			{"TooManyRequests", http.StatusTooManyRequests, nil, 3, errBadUpstream, http.StatusNotFound, "no-store"},
+			{"InternalServerError", http.StatusInternalServerError, nil, 3, errBadUpstream, http.StatusNotFound, "no-store"},
+			{"BadGateway", http.StatusBadGateway, nil, 3, errBadUpstream, http.StatusNotFound, "no-store"},
+			{"ServiceUnavailable", http.StatusServiceUnavailable, nil, 3, errBadUpstream, http.StatusNotFound, "no-store"},
+			{"GatewayTimeout", http.StatusGatewayTimeout, nil, 3, errFetchTimedOut, http.StatusNotFound, "no-store"},
+			{"GatewayTimeoutReadError", http.StatusGatewayTimeout, io.ErrUnexpectedEOF, 3, errFetchTimedOut, http.StatusNotFound, "no-store"},
+			{"GatewayTimeoutReadNotExist", http.StatusGatewayTimeout, fs.ErrNotExist, 3, errFetchTimedOut, http.StatusNotFound, "no-store"},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					attempts := 0
+					var bodies []*testHTTPResponseBody
+					client := &http.Client{Transport: httpRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+						attempts++
+						var reader io.Reader = strings.NewReader("upstream details")
+						if tt.readErr != nil {
+							reader = iotest.ErrReader(tt.readErr)
+						}
+						body := &testHTTPResponseBody{Reader: reader}
+						bodies = append(bodies, body)
+						return &http.Response{
+							StatusCode: tt.statusCode,
+							Status:     strconv.Itoa(tt.statusCode) + " " + http.StatusText(tt.statusCode),
+							Header:     http.Header{"Cache-Control": {"public"}},
+							Body:       body,
+							Request:    req,
+						}, nil
+					})}
+					header, err := httpGet(t.Context(), client, "https://example.com", nil)
+					if err == nil {
+						t.Fatal("expected error")
+					}
+					if header != nil {
+						t.Errorf("got header %v, want nil", header)
+					}
+					if tt.wantErr != nil && !errors.Is(err, tt.wantErr) {
+						t.Errorf("got error %v, want an error matching %v", err, tt.wantErr)
+					}
+					if got, want := errors.Is(err, fs.ErrNotExist), tt.wantErr == fs.ErrNotExist; got != want {
+						t.Errorf("got absence %t, want %t", got, want)
+					}
+					httpErr, ok := errors.AsType[*httpError](err)
+					if tt.wantErr == fs.ErrNotExist {
+						if ok {
+							t.Errorf("unexpected HTTP failure %v", httpErr)
+						}
+					} else if !ok || httpErr.statusCode != tt.statusCode {
+						t.Errorf("got error %#v, want HTTP status %d", httpErr, tt.statusCode)
+					}
+					if got, want := attempts, tt.wantAttempts; got != want {
+						t.Errorf("got attempts %d, want %d", got, want)
+					}
+					for _, body := range bodies {
+						if !body.closed {
+							t.Error("response body was not closed")
+						}
+					}
+					rec := httptest.NewRecorder()
+					responseError(rec, httptest.NewRequest(http.MethodGet, "/", nil), err)
+					if got, want := rec.Code, tt.wantStatusCode; got != want {
+						t.Errorf("got module status %d, want %d", got, want)
+					}
+					if got, want := rec.Header().Get("Cache-Control"), tt.wantCacheControl; got != want {
+						t.Errorf("got module cache control %q, want %q", got, want)
+					}
+				})
+			})
+		}
+	})
+
+	t.Run("ResponseErrorURL", func(t *testing.T) {
+		for _, tt := range []struct {
+			name           string
+			redirect       bool
+			missingRequest bool
+			missingURL     bool
+			wantURL        string
+		}{
+			{"Provided", false, false, false, "https://user:xxxxx@example.com/original"},
+			{"MissingRequest", false, true, false, "https://user:xxxxx@example.com/original"},
+			{"MissingURL", false, false, true, "https://user:xxxxx@example.com/original"},
+			{"Redirect", true, false, false, "https://user:xxxxx@example.com/redirected"},
+			{"RedirectMissingRequest", true, true, false, "https://user:xxxxx@example.com/original"},
+			{"RedirectMissingURL", true, false, true, "https://user:xxxxx@example.com/original"},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				attempts := 0
+				body := &testHTTPResponseBody{Reader: strings.NewReader("upstream details")}
+				client := &http.Client{Transport: httpRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					attempts++
+					if tt.redirect && attempts == 1 {
+						return &http.Response{
+							StatusCode: http.StatusFound,
+							Header:     http.Header{"Location": {"/redirected"}},
+							Body:       http.NoBody,
+						}, nil
+					}
+					resp := &http.Response{
+						StatusCode: http.StatusBadRequest,
+						Status:     "400 Bad Request",
+						Body:       body,
+						Request:    req,
+					}
+					if tt.missingRequest {
+						resp.Request = nil
+					} else if tt.missingURL {
+						resp.Request = &http.Request{}
+					}
+					return resp, nil
+				})}
+				header, err := httpGet(t.Context(), client, "https://user:secret@example.com/original", nil)
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				if got, want := err.Error(), "GET "+tt.wantURL+": 400 Bad Request: upstream details"; got != want {
+					t.Errorf("got %q, want %q", got, want)
+				}
+				if e, ok := errors.AsType[*httpError](err); !ok || e.statusCode != http.StatusBadRequest {
+					t.Errorf("got error %v, want HTTP status %d", err, http.StatusBadRequest)
+				}
+				if header != nil {
+					t.Errorf("got header %v, want nil", header)
+				}
+				wantAttempts := 1
+				if tt.redirect {
+					wantAttempts = 2
+				}
+				if got, want := attempts, wantAttempts; got != want {
+					t.Errorf("got attempts %d, want %d", got, want)
+				}
+				if !body.closed {
+					t.Error("response body was not closed")
+				}
+			})
+		}
+	})
+
+	t.Run("TransportRetries", func(t *testing.T) {
+		notFound := &net.DNSError{Err: "no such host", Name: "example.com", IsNotFound: true}
+		temporary := &net.DNSError{Err: "server misbehaving", Name: "example.com", IsTemporary: true}
+		for _, tt := range []struct {
+			name         string
+			err          error
+			failures     int
+			wantAttempts int
+			wantErr      error
+		}{
+			{"LastAttemptSuccess", syscall.ECONNRESET, 2, 3, nil},
+			{"Exhausted", syscall.ECONNRESET, 3, 3, syscall.ECONNRESET},
+			{"RequestTimeout", testHTTPTimeoutError{}, 2, 3, nil},
+			{"RequestTimeoutExhausted", testHTTPTimeoutError{}, 3, 3, testHTTPTimeoutError{}},
+			{"RequestDeadline", context.DeadlineExceeded, 3, 3, context.DeadlineExceeded},
+			{"DNSNotFound", &net.OpError{Op: "dial", Net: "tcp", Err: notFound}, 3, 1, notFound},
+			{"DNSTemporary", &net.OpError{Op: "dial", Net: "tcp", Err: temporary}, 3, 3, temporary},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					attempts := 0
+					var lastAttempt time.Time
+					client := &http.Client{Transport: httpRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+						attempts++
+						lastAttempt = time.Now()
+						if attempts <= tt.failures {
+							return nil, tt.err
+						}
+						return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+					})}
+					_, err := httpGet(t.Context(), client, "https://example.com", nil)
+					if !errors.Is(err, tt.wantErr) {
+						t.Errorf("got error %v, want %v", err, tt.wantErr)
+					}
+					if got, want := attempts, tt.wantAttempts; got != want {
+						t.Errorf("got attempts %d, want %d", got, want)
+					}
+					if got := time.Since(lastAttempt); got != 0 {
+						t.Errorf("got delay after final attempt %v, want 0", got)
+					}
+				})
+			})
+		}
+	})
+
+	t.Run("ResponseHeaderTimeout", func(t *testing.T) {
+		for _, tt := range []struct {
+			name         string
+			failures     int32
+			wantAttempts int32
+		}{
+			{"Recovery", 1, 2},
+			{"Exhausted", 3, 3},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				var attempts atomic.Int32
+				server := newHTTPTestServer(t, http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+					if attempts.Add(1) <= tt.failures {
+						<-req.Context().Done()
+						return
+					}
+					fmt.Fprint(rw, "foobar")
+				}))
+				transport := http.DefaultTransport.(*http.Transport).Clone()
+				transport.ResponseHeaderTimeout = 50 * time.Millisecond
+				defer transport.CloseIdleConnections()
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				var content bytes.Buffer
+				_, err := httpGet(ctx, &http.Client{Transport: transport}, server.URL, &content)
+				if tt.failures < tt.wantAttempts {
+					if err != nil {
+						t.Fatalf("unexpected error %v", err)
+					}
+					if got, want := content.String(), "foobar"; got != want {
+						t.Errorf("got content %q, want %q", got, want)
+					}
+				} else if !errors.Is(err, context.DeadlineExceeded) {
+					t.Errorf("got error %v, want a timeout", err)
+				}
+				if err := ctx.Err(); err != nil {
+					t.Errorf("unexpected caller context error %v", err)
+				}
+				if got, want := attempts.Load(), tt.wantAttempts; got != want {
+					t.Errorf("got attempts %d, want %d", got, want)
+				}
+			})
+		}
+	})
+
+	t.Run("ContextExpiresDuringRequest", func(t *testing.T) {
+		for _, tt := range []struct {
+			name    string
+			ctx     func(*testing.T) (context.Context, context.CancelFunc)
+			wantErr error
+		}{
+			{"Canceled", func(t *testing.T) (context.Context, context.CancelFunc) { return context.WithCancel(t.Context()) }, context.Canceled},
+			{"Deadline", func(t *testing.T) (context.Context, context.CancelFunc) {
+				return context.WithTimeout(t.Context(), time.Second)
+			}, context.DeadlineExceeded},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					ctx, cancel := tt.ctx(t)
+					defer cancel()
+					attempts := 0
+					client := &http.Client{Transport: httpRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+						attempts++
+						if tt.wantErr == context.Canceled {
+							cancel()
+						} else {
+							time.Sleep(time.Second)
+						}
+						return nil, testHTTPTimeoutError{}
+					})}
+					_, err := httpGet(ctx, client, "https://example.com", nil)
+					if !errors.Is(err, tt.wantErr) {
+						t.Errorf("got error %v, want %v", err, tt.wantErr)
+					}
+					if attempts != 1 {
+						t.Errorf("got attempts %d, want 1", attempts)
+					}
+				})
+			})
+		}
+	})
+
+	t.Run("ContextExpiresWhileReadingErrorBody", func(t *testing.T) {
+		for _, tt := range []struct {
+			name       string
+			statusCode int
+			cancel     bool
+			wantErr    error
+		}{
+			{"RequestTimeoutCanceled", http.StatusRequestTimeout, true, context.Canceled},
+			{"RequestTimeoutDeadline", http.StatusRequestTimeout, false, context.DeadlineExceeded},
+			{"GatewayTimeoutCanceled", http.StatusGatewayTimeout, true, context.Canceled},
+			{"GatewayTimeoutDeadline", http.StatusGatewayTimeout, false, context.DeadlineExceeded},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+					defer cancel()
+					reader, writer := io.Pipe()
+					defer reader.Close()
+					defer writer.Close()
+					body := &testHTTPResponseBody{Reader: reader}
+					attempts := 0
+					client := &http.Client{Transport: httpRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+						attempts++
+						return &http.Response{StatusCode: tt.statusCode, Body: body}, nil
+					})}
+					go func() {
+						if tt.cancel {
+							synctest.Wait()
+							cancel()
+						}
+						<-ctx.Done()
+						writer.CloseWithError(ctx.Err())
+					}()
+					_, err := httpGet(ctx, client, "https://example.com", nil)
+					if !errors.Is(err, tt.wantErr) {
+						t.Errorf("got error %v, want %v", err, tt.wantErr)
+					}
+					if attempts != 1 {
+						t.Errorf("got attempts %d, want 1", attempts)
+					}
+					if !body.closed {
+						t.Error("response body was not closed")
+					}
+				})
+			})
+		}
+	})
+
+	t.Run("CertificateErrors", func(t *testing.T) {
+		server := httptest.NewTLSServer(http.NotFoundHandler())
+		defer server.Close()
+		for _, tt := range []struct {
+			name      string
+			configure func(*tls.Config)
+		}{
+			{"UnknownAuthority", func(c *tls.Config) { c.RootCAs = x509.NewCertPool() }},
+			{"Hostname", func(c *tls.Config) { c.ServerName = "mismatch.invalid" }},
+			{"Expired", func(c *tls.Config) {
+				c.Time = func() time.Time { return server.Certificate().NotAfter.Add(time.Second) }
+			}},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				transport := server.Client().Transport.(*http.Transport).Clone()
+				defer transport.CloseIdleConnections()
+				transport.TLSClientConfig.Time = func() time.Time { return server.Certificate().NotBefore.Add(time.Hour) }
+				tt.configure(transport.TLSClientConfig)
+				attempts := 0
+				client := &http.Client{Transport: httpRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					attempts++
+					return transport.RoundTrip(req)
+				})}
+				_, err := httpGet(t.Context(), client, server.URL, nil)
+				if _, ok := errors.AsType[*tls.CertificateVerificationError](err); !ok {
+					t.Errorf("got error %v, want a certificate verification error", err)
+				}
+				if got, want := attempts, 1; got != want {
+					t.Errorf("got attempts %d, want %d", got, want)
+				}
+			})
+		}
+	})
+
+	t.Run("RetryAfter", func(t *testing.T) {
+		for _, statusCode := range []int{
+			http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway,
+			http.StatusServiceUnavailable, http.StatusGatewayTimeout,
+		} {
+			for _, tt := range []struct {
+				name         string
+				values       []string
+				date         bool
+				wantAttempts int
+				wantDelay    time.Duration
+			}{
+				{"Seconds", []string{"1"}, false, 2, time.Second},
+				{"LeadingZeros", []string{"0001"}, false, 2, time.Second},
+				{"Whitespace", []string{" \t1\t "}, false, 2, time.Second},
+				{"Date", []string{http.TimeFormat}, true, 2, time.Second},
+				{"RFC850Date", []string{time.RFC850}, true, 2, time.Second},
+				{"ANSICDate", []string{time.ANSIC}, true, 2, time.Second},
+				{"OverLimit", []string{"2"}, false, 1, 0},
+				{"LongDelay", []string{"60"}, false, 1, 0},
+				{"DurationOverflow", []string{"9223372037"}, false, 1, 0},
+				{"IntegerOverflow", []string{strings.Repeat("9", 128)}, false, 1, 0},
+				{"DistantDate", []string{"Fri, 31 Dec 9999 23:59:59 GMT"}, false, 1, 0},
+				{"Absent", nil, false, 2, -1},
+				{"Zero", []string{"0"}, false, 2, -1},
+				{"PastDate", []string{"Sun, 06 Nov 1994 08:49:37 GMT"}, false, 2, -1},
+				{"Invalid", []string{"invalid"}, false, 2, -1},
+				{"Negative", []string{"-1"}, false, 2, -1},
+				{"Signed", []string{"+1"}, false, 2, -1},
+				{"Fractional", []string{"0.5"}, false, 2, -1},
+				{"Quoted", []string{"\"1\""}, false, 2, -1},
+				{"InvalidOverflowSuffix", []string{strings.Repeat("9", 128) + "x"}, false, 2, -1},
+				{"RepeatedFields", []string{"1", "60"}, false, 2, -1},
+				{"CombinedFields", []string{"1, 60"}, false, 2, -1},
+			} {
+				t.Run(strconv.Itoa(statusCode)+"/"+tt.name, func(t *testing.T) {
+					synctest.Test(t, func(t *testing.T) {
+						started := time.Now()
+						values := tt.values
+						if tt.date {
+							values = []string{started.Add(time.Second).UTC().Format(tt.values[0])}
+						}
+						body := &testHTTPResponseBody{Reader: strings.NewReader("upstream details")}
+						attempts := 0
+						client := &http.Client{Transport: httpRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+							attempts++
+							if attempts > 1 {
+								if !body.closed {
+									t.Error("response body was not closed before retrying")
+								}
+								return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+							}
+							return &http.Response{
+								StatusCode: statusCode,
+								Header:     http.Header{"Retry-After": values},
+								Body:       body,
+							}, nil
+						})}
+						_, err := httpGet(t.Context(), client, "https://example.com", nil)
+						if tt.wantAttempts == 1 {
+							httpErr, ok := errors.AsType[*httpError](err)
+							if !ok || httpErr.statusCode != statusCode {
+								t.Errorf("got error %#v, want HTTP status %d", err, statusCode)
+							}
+							wantErr := errBadUpstream
+							if statusCode == http.StatusRequestTimeout || statusCode == http.StatusGatewayTimeout {
+								wantErr = errFetchTimedOut
+							}
+							if !errors.Is(err, wantErr) {
+								t.Errorf("got error %v, want %v", err, wantErr)
+							}
+							if t.Context().Err() != nil {
+								t.Error("request context was canceled")
+							}
+						} else if err != nil {
+							t.Errorf("unexpected error %v", err)
+						}
+						if got, want := attempts, tt.wantAttempts; got != want {
+							t.Errorf("got attempts %d, want %d", got, want)
+						}
+						if got := time.Since(started); tt.wantDelay >= 0 {
+							if got != tt.wantDelay {
+								t.Errorf("got delay %v, want %v", got, tt.wantDelay)
+							}
+						} else if got >= 100*time.Millisecond {
+							t.Errorf("got delay %v, want less than 100ms", got)
+						}
+						if !body.closed {
+							t.Error("response body was not closed")
+						}
+					})
+				})
+			}
+		}
+	})
+
+	t.Run("RetryAfterContext", func(t *testing.T) {
+		for _, tt := range []struct {
+			name      string
+			timeout   time.Duration
+			cancel    bool
+			wantErr   error
+			wantDelay time.Duration
+		}{
+			{"InsufficientTime", 500 * time.Millisecond, false, errBadUpstream, 0},
+			{"DeadlineBoundary", time.Second, false, errBadUpstream, 0},
+			{"CanceledWhileWaiting", 0, true, context.Canceled, 200 * time.Millisecond},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					ctx, cancel := context.WithCancel(t.Context())
+					defer cancel()
+					if tt.timeout > 0 {
+						var stop context.CancelFunc
+						ctx, stop = context.WithTimeout(ctx, tt.timeout)
+						defer stop()
+					}
+					if tt.cancel {
+						go func() {
+							time.Sleep(tt.wantDelay)
+							cancel()
+						}()
+					}
+					attempts := 0
+					client := &http.Client{Transport: httpRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+						attempts++
+						return &http.Response{
+							StatusCode: http.StatusServiceUnavailable,
+							Header:     http.Header{"Retry-After": {"1"}},
+							Body:       http.NoBody,
+						}, nil
+					})}
+					started := time.Now()
+					_, err := httpGet(ctx, client, "https://example.com", nil)
+					if !errors.Is(err, tt.wantErr) {
+						t.Errorf("got error %v, want %v", err, tt.wantErr)
+					}
+					if got, want := attempts, 1; got != want {
+						t.Errorf("got attempts %d, want %d", got, want)
+					}
+					if got, want := time.Since(started), tt.wantDelay; got != want {
+						t.Errorf("got delay %v, want %v", got, want)
+					}
+					if !tt.cancel && ctx.Err() != nil {
+						t.Errorf("unexpected context error %v", ctx.Err())
+					}
+				})
+			})
+		}
+	})
+
+	t.Run("RetryAfterAttempts", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			attempts := 0
+			client := &http.Client{Transport: httpRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				attempts++
+				return &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Header:     http.Header{"Retry-After": {"1"}},
+					Body:       http.NoBody,
+				}, nil
+			})}
+			started := time.Now()
+			if _, err := httpGet(t.Context(), client, "https://example.com", nil); !errors.Is(err, errBadUpstream) {
+				t.Errorf("got error %v, want %v", err, errBadUpstream)
+			}
+			if got, want := attempts, 3; got != want {
+				t.Errorf("got attempts %d, want %d", got, want)
+			}
+			if got, want := time.Since(started), 2*time.Second; got != want {
+				t.Errorf("got delay %v, want %v", got, want)
+			}
+		})
+	})
+
+	t.Run("RetryAfterBody", func(t *testing.T) {
+		for _, tt := range []struct {
+			name      string
+			bodyDelay time.Duration
+			timeout   time.Duration
+			wantErr   error
+			minDelay  time.Duration
+			maxDelay  time.Duration
+		}{
+			{"ShortRead", 200 * time.Millisecond, 0, nil, time.Second, time.Second},
+			{"ExpiredAfterRead", 2 * time.Second, 0, nil, 2 * time.Second, 2100 * time.Millisecond},
+			{"DeadlineDuringRead", 600 * time.Millisecond, 500 * time.Millisecond, context.DeadlineExceeded, 600 * time.Millisecond, 600 * time.Millisecond},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					ctx := t.Context()
+					if tt.timeout > 0 {
+						var cancel context.CancelFunc
+						ctx, cancel = context.WithTimeout(ctx, tt.timeout)
+						defer cancel()
+					}
+					r, w := io.Pipe()
+					defer r.Close()
+					go func() {
+						time.Sleep(tt.bodyDelay)
+						w.Close()
+					}()
+					body := &testHTTPResponseBody{Reader: r}
+					attempts := 0
+					client := &http.Client{Transport: httpRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+						attempts++
+						if attempts > 1 {
+							if !body.closed {
+								t.Error("response body was not closed before retrying")
+							}
+							return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+						}
+						return &http.Response{
+							StatusCode: http.StatusServiceUnavailable,
+							Header:     http.Header{"Retry-After": {"1"}},
+							Body:       body,
+						}, nil
+					})}
+					started := time.Now()
+					_, err := httpGet(ctx, client, "https://example.com", nil)
+					if !errors.Is(err, tt.wantErr) {
+						t.Errorf("got error %v, want %v", err, tt.wantErr)
+					}
+					wantAttempts := 2
+					if tt.wantErr != nil {
+						wantAttempts = 1
+					}
+					if got, want := attempts, wantAttempts; got != want {
+						t.Errorf("got attempts %d, want %d", got, want)
+					}
+					if got := time.Since(started); got < tt.minDelay || got > tt.maxDelay {
+						t.Errorf("got delay %v, want between %v and %v", got, tt.minDelay, tt.maxDelay)
+					}
+					if !body.closed {
+						t.Error("response body was not closed")
+					}
+				})
+			})
+		}
+	})
+
+	t.Run("RetryAfterNonRetryable", func(t *testing.T) {
+		for _, statusCode := range []int{
+			http.StatusOK, http.StatusBadRequest, http.StatusNotFound, http.StatusGone, http.StatusNotImplemented,
+		} {
+			t.Run(strconv.Itoa(statusCode), func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) {
+					attempts := 0
+					client := &http.Client{Transport: httpRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+						attempts++
+						return &http.Response{
+							StatusCode: statusCode,
+							Header:     http.Header{"Retry-After": {"60"}},
+							Body:       http.NoBody,
+							Request:    req,
+						}, nil
+					})}
+					started := time.Now()
+					_, err := httpGet(t.Context(), client, "https://example.com", nil)
+					if got, want := err == nil, statusCode == http.StatusOK; got != want {
+						t.Errorf("got error %v for status %d", err, statusCode)
+					}
+					if got, want := attempts, 1; got != want {
+						t.Errorf("got attempts %d, want %d", got, want)
+					}
+					if got := time.Since(started); got != 0 {
+						t.Errorf("got delay %v, want 0", got)
+					}
+				})
+			})
+		}
+	})
+
+	t.Run("ErrorBodyLimit", func(t *testing.T) {
+		const maxErrorBodySize = 4 << 10
+		atLimit := strings.Repeat("x", maxErrorBodySize)
+		aboveLimit := atLimit + "x"
+		for _, statusCode := range []int{
+			http.StatusBadRequest, http.StatusRequestTimeout, http.StatusNotFound, http.StatusGone,
+			http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway,
+			http.StatusServiceUnavailable, http.StatusGatewayTimeout, http.StatusNotImplemented,
+		} {
+			for _, tt := range []struct {
+				name        string
+				content     io.Reader
+				wantRead    int
+				wantMessage string
+				wantErr     error
+			}{
+				{"Empty", strings.NewReader(""), 0, "", nil},
+				{"Small", strings.NewReader("not found"), 9, "not found", nil},
+				{"BelowLimit", strings.NewReader(atLimit[:maxErrorBodySize-1]), maxErrorBodySize - 1, atLimit[:maxErrorBodySize-1], nil},
+				{"AtLimit", strings.NewReader(atLimit), maxErrorBodySize, atLimit, nil},
+				{"AboveLimit", strings.NewReader(aboveLimit), maxErrorBodySize + 1, atLimit + "... (truncated)", nil},
+				{"BadUpstreamAfterLimit", strings.NewReader(aboveLimit + "bad upstream"), maxErrorBodySize + 1, atLimit + "... (truncated)", nil},
+				{"TimeoutAfterLimit", strings.NewReader(aboveLimit + "fetch timed out"), maxErrorBodySize + 1, atLimit + "... (truncated)", nil},
+				{"TwoByteRune", strings.NewReader(atLimit[:maxErrorBodySize-1] + "\u00e9"), maxErrorBodySize + 1, atLimit[:maxErrorBodySize-1] + "... (truncated)", nil},
+				{"ThreeByteRune", strings.NewReader(atLimit[:maxErrorBodySize-2] + "\u4e2d"), maxErrorBodySize + 1, atLimit[:maxErrorBodySize-2] + "... (truncated)", nil},
+				{"FourByteRune", strings.NewReader(atLimit[:maxErrorBodySize-3] + "\U0001f600"), maxErrorBodySize + 1, atLimit[:maxErrorBodySize-3] + "... (truncated)", nil},
+				{"CompleteRuneAtLimit", strings.NewReader(atLimit[:maxErrorBodySize-3] + "\u4e2d" + "x"), maxErrorBodySize + 1, atLimit[:maxErrorBodySize-3] + "\u4e2d... (truncated)", nil},
+				{"InvalidUTF8", strings.NewReader(strings.Repeat("\x80", maxErrorBodySize+1)), maxErrorBodySize + 1, "... (truncated)", nil},
+				{"ReadError", iotest.ErrReader(io.ErrUnexpectedEOF), 0, "", io.ErrUnexpectedEOF},
+				{"DataAndReadError", iotest.DataErrReader(io.MultiReader(strings.NewReader("foo"), iotest.ErrReader(io.ErrUnexpectedEOF))), 3, "", io.ErrUnexpectedEOF},
+				{"AboveLimitAndReadError", iotest.DataErrReader(io.MultiReader(strings.NewReader(aboveLimit), iotest.ErrReader(io.ErrUnexpectedEOF))), maxErrorBodySize + 1, "", io.ErrUnexpectedEOF},
+				{"ReadErrorAfterLimit", io.MultiReader(strings.NewReader(aboveLimit), iotest.ErrReader(io.ErrUnexpectedEOF)), maxErrorBodySize + 1, atLimit + "... (truncated)", nil},
+			} {
+				t.Run(strconv.Itoa(statusCode)+"/"+tt.name, func(t *testing.T) {
+					synctest.Test(t, func(t *testing.T) {
+						body := &testHTTPResponseBody{Reader: tt.content}
+						attempts := 0
+						client := &http.Client{Transport: httpRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+							attempts++
+							if attempts > 1 {
+								if !body.closed {
+									t.Error("response body was not closed before retrying")
+								}
+								return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+							}
+							return &http.Response{
+								StatusCode:    statusCode,
+								Status:        strconv.Itoa(statusCode) + " " + http.StatusText(statusCode),
+								Body:          body,
+								ContentLength: -1,
+								Request:       req,
+							}, nil
+						})}
+						_, err := httpGet(t.Context(), client, "https://example.com", nil)
+						if got, want := body.bytesRead, tt.wantRead; got != want {
+							t.Errorf("got bytes read %d, want %d", got, want)
+						}
+						if !body.closed {
+							t.Error("response body was not closed")
+						}
+						wantAttempts := 1
+						if tt.wantErr != nil && statusCode != http.StatusRequestTimeout && statusCode != http.StatusGatewayTimeout {
+							if !errors.Is(err, tt.wantErr) {
+								t.Errorf("got %v, want %v", err, tt.wantErr)
+							}
+						} else {
+							switch statusCode {
+							case http.StatusNotFound, http.StatusGone:
+								if !errors.Is(err, fs.ErrNotExist) {
+									t.Fatalf("got %v, want %v", err, fs.ErrNotExist)
+								}
+								if got, want := err.Error(), tt.wantMessage; got != want {
+									t.Errorf("got %q, want %q", got, want)
+								}
+								rec := httptest.NewRecorder()
+								responseError(rec, httptest.NewRequest(http.MethodGet, "/", nil), err)
+								if got, want := rec.Header().Get("Cache-Control"), "public, max-age=60"; got != want {
+									t.Errorf("got %q, want %q", got, want)
+								}
+							case http.StatusBadRequest, http.StatusNotImplemented:
+								want := fmt.Sprintf("GET https://example.com: %d %s: %s", statusCode, http.StatusText(statusCode), tt.wantMessage)
+								if err == nil || err.Error() != want {
+									t.Errorf("got %v, want %s", err, want)
+								}
+								if errors.Is(err, fs.ErrNotExist) {
+									t.Errorf("unexpected absence error %v", err)
+								}
+							default:
+								wantAttempts = 2
+								if err != nil {
+									t.Errorf("unexpected error %v", err)
+								}
+							}
+						}
+						if got, want := attempts, wantAttempts; got != want {
+							t.Errorf("got attempts %d, want %d", got, want)
+						}
+					})
+				})
+			}
+		}
+	})
+
+	t.Run("CacheRestrictions", func(t *testing.T) {
+		for _, statusCode := range []int{http.StatusBadRequest, http.StatusNotFound, http.StatusGone} {
+			for _, tt := range []struct {
+				name             string
+				header           http.Header
+				body             string
+				wantCacheControl string
+			}{
+				{"OrdinaryAbsence", nil, "module unavailable", "public, max-age=60"},
+				{"NoStore", http.Header{"Cache-Control": {"no-store"}}, "module unavailable", "no-store"},
+				{"NoCache", http.Header{"Cache-Control": {"no-cache"}}, "module unavailable", "no-store"},
+				{"Private", http.Header{"Cache-Control": {"private"}}, "module unavailable", "no-store"},
+				{"MustRevalidate", http.Header{"Cache-Control": {"max-age=60, must-revalidate"}}, "module unavailable", "no-store"},
+				{"ProxyRevalidate", http.Header{"Cache-Control": {"proxy-revalidate"}}, "module unavailable", "no-store"},
+				{"ZeroMaxAge", http.Header{"Cache-Control": {"max-age=0"}}, "module unavailable", "no-store"},
+				{"QuotedZeroMaxAge", http.Header{"Cache-Control": {`max-age="\0"`}}, "module unavailable", "no-store"},
+				{"ZeroSharedMaxAge", http.Header{"Cache-Control": {"s-maxage=0"}}, "module unavailable", "no-store"},
+				{"PositiveSharedMaxAge", http.Header{"Cache-Control": {"s-maxage=60"}}, "module unavailable", "no-store"},
+				{"PositiveMaxAge", http.Header{"Cache-Control": {"max-age=60"}}, "module unavailable", "public, max-age=60"},
+				{"InvalidMaxAge", http.Header{"Cache-Control": {"max-age=invalid"}}, "module unavailable", "no-store"},
+				{"DuplicateMaxAge", http.Header{"Cache-Control": {"max-age=60, max-age=120"}}, "module unavailable", "no-store"},
+				{"VaryAll", http.Header{"Vary": {"*"}}, "module unavailable", "no-store"},
+				{"BadUpstreamText", nil, "unknown revision bad upstream", "public, max-age=60"},
+				{"TimeoutText", nil, "unknown revision fetch timed out", "public, max-age=60"},
+				{"RestrictedTimeoutText", http.Header{"Cache-Control": {"no-store"}}, "request timed out", "no-store"},
+				{"RestrictionAfterSplitQuotedArgument", http.Header{"Cache-Control": {`extension="a`, `b", no-store`}}, "module unavailable", "no-store"},
+				{"SplitQuotedArgument", http.Header{"Cache-Control": {`extension="a`, "no-store", `b", public`}}, "module unavailable", "public, max-age=60"},
+			} {
+				t.Run(strconv.Itoa(statusCode)+"/"+tt.name, func(t *testing.T) {
+					server := newHTTPTestServer(t, http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+						maps.Copy(rw.Header(), tt.header)
+						rw.WriteHeader(statusCode)
+						fmt.Fprint(rw, tt.body)
+					}))
+					_, err := httpGet(t.Context(), http.DefaultClient, server.URL, nil)
+					if err == nil {
+						t.Fatal("expected error")
+					}
+					wantMessage := tt.body
+					wantStatusCode := http.StatusNotFound
+					wantCacheControl := tt.wantCacheControl
+					wantContent := "not found: " + tt.body
+					if statusCode == http.StatusBadRequest {
+						wantMessage = "GET " + server.URL + ": 400 Bad Request: " + tt.body
+						wantStatusCode = http.StatusInternalServerError
+						wantCacheControl = "no-store"
+						wantContent = "internal server error"
+					}
+					if got, want := errors.Is(err, fs.ErrNotExist), statusCode != http.StatusBadRequest; got != want {
+						t.Errorf("got absence %t, want %t", got, want)
+					}
+					if got, want := err.Error(), wantMessage; got != want {
+						t.Errorf("got %q, want %q", got, want)
+					}
+					rec := httptest.NewRecorder()
+					responseError(rec, httptest.NewRequest(http.MethodGet, "/", nil), err)
+					if got, want := rec.Code, wantStatusCode; got != want {
+						t.Errorf("got %d, want %d", got, want)
+					}
+					if got, want := rec.Header().Get("Cache-Control"), wantCacheControl; got != want {
+						t.Errorf("got %q, want %q", got, want)
+					}
+					if got, want := rec.Body.String(), wantContent; got != want {
+						t.Errorf("got %q, want %q", got, want)
+					}
+				})
+			}
+		}
+	})
+
+	t.Run("InvalidURL", func(t *testing.T) {
+		if _, err := httpGet(t.Context(), http.DefaultClient, "::", nil); err == nil {
+			t.Fatal("expected error")
+		} else if _, ok := errors.AsType[*internalError](err); !ok {
+			t.Errorf("got error %v, want an internal error", err)
+		}
+	})
+}
+
+func TestHTTPGetTemp(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		handler     http.HandlerFunc
+		wantContent string
+		wantErr     error
+	}{
+		{
+			name:        "Success",
+			handler:     func(rw http.ResponseWriter, req *http.Request) { fmt.Fprint(rw, "foobar") },
+			wantContent: "foobar",
+		},
+		{
+			name: "NotFound",
+			handler: func(rw http.ResponseWriter, req *http.Request) {
+				rw.WriteHeader(http.StatusNotFound)
+				fmt.Fprint(rw, "not found")
+			},
+			wantErr: fs.ErrNotExist,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := newHTTPTestServer(t, tt.handler)
+
+			tempFile, _, err := httpGetTemp(t.Context(), http.DefaultClient, server.URL, t.TempDir(), 0)
+			if tt.wantErr != nil {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				if got, want := err, tt.wantErr; !compareErrors(got, want) {
+					t.Errorf("got %v, want %v", got, want)
+				}
+				if _, err := os.Stat(tempFile); err == nil {
+					t.Error("expected error")
+				} else if got, want := err, fs.ErrNotExist; !compareErrors(got, want) {
+					t.Errorf("got %v, want %v", got, want)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("unexpected error %v", err)
+				}
+				if b, err := os.ReadFile(tempFile); err != nil {
+					t.Errorf("unexpected error %v", err)
+				} else if got, want := string(b), tt.wantContent; got != want {
+					t.Errorf("got %q, want %q", got, want)
+				}
+			}
+		})
+	}
+
+	t.Run("BodyLimit", func(t *testing.T) {
+		for _, tt := range []struct {
+			name          string
+			content       string
+			maxBytes      int64
+			oneByte       bool
+			writerTo      bool
+			contentLength int64
+			readErr       error
+			wantErr       error
+			wantEarlyStop bool
+		}{
+			{name: "Unlimited", content: "foobar"},
+			{name: "Empty", maxBytes: 6},
+			{name: "BelowLimit", content: "fooba", maxBytes: 6},
+			{name: "AtLimit", content: "foobar", maxBytes: 6},
+			{name: "AtLimitMultipleWrites", content: "foobar", maxBytes: 6, oneByte: true},
+			{name: "AtLimitWriterTo", content: "foobar", maxBytes: 6, writerTo: true},
+			{name: "AboveLimit", content: "foobars", maxBytes: 6, wantErr: errBadUpstream},
+			{name: "AboveLimitMultipleWrites", content: "foobars", maxBytes: 6, oneByte: true, wantErr: errBadUpstream},
+			{name: "AboveLimitWriterTo", content: "foobars", maxBytes: 6, writerTo: true, wantErr: errBadUpstream},
+			{name: "MisleadingContentLength", content: "foobars", maxBytes: 6, contentLength: 1, wantErr: errBadUpstream},
+			{name: "LargeResponse", content: strings.Repeat("x", 1<<20), maxBytes: 6, wantErr: errBadUpstream, wantEarlyStop: true},
+			{name: "ReadError", content: "foobar", maxBytes: 6, readErr: io.ErrUnexpectedEOF, wantErr: io.ErrUnexpectedEOF},
+			{name: "Canceled", content: "foobar", maxBytes: 6, readErr: context.Canceled, wantErr: context.Canceled},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				var reader io.Reader = strings.NewReader(tt.content)
+				if tt.oneByte {
+					reader = iotest.OneByteReader(reader)
+				}
+				if tt.readErr != nil {
+					reader = io.MultiReader(reader, iotest.ErrReader(tt.readErr))
+				}
+				body := &testHTTPResponseBody{Reader: reader}
+				var responseBody io.ReadCloser = body
+				if tt.writerTo {
+					responseBody = struct {
+						io.ReadCloser
+						io.WriterTo
+					}{body, strings.NewReader(tt.content)}
+				}
+				attempts := 0
+				client := &http.Client{Transport: httpRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+					attempts++
+					contentLength := tt.contentLength
+					if contentLength == 0 {
+						contentLength = -1
+					}
+					return &http.Response{
+						StatusCode:    http.StatusOK,
+						Header:        http.Header{"Cache-Control": {"no-store"}},
+						ContentLength: contentLength,
+						Body:          responseBody,
+						Request:       req,
+					}, nil
+				})}
+				tempDir := t.TempDir()
+				file, header, err := httpGetTemp(t.Context(), client, "https://example.com", tempDir, tt.maxBytes)
+				if tt.wantErr == nil {
+					if err != nil {
+						t.Fatalf("unexpected error %v", err)
+					}
+					if got, want := header.Get("Cache-Control"), "no-store"; got != want {
+						t.Errorf("got cache control %q, want %q", got, want)
+					}
+					if content, err := os.ReadFile(file); err != nil {
+						t.Fatal(err)
+					} else if got, want := string(content), tt.content; got != want {
+						t.Errorf("got content %q, want %q", got, want)
+					}
+				} else {
+					if !errors.Is(err, tt.wantErr) {
+						t.Fatalf("got error %v, want %v", err, tt.wantErr)
+					}
+					if tt.wantErr == errBadUpstream {
+						if got, want := err.Error(), fmt.Sprintf("bad upstream: response body exceeds %d bytes", tt.maxBytes); got != want {
+							t.Errorf("got error %q, want %q", got, want)
+						}
+						if errors.Is(err, fs.ErrNotExist) {
+							t.Errorf("unexpected error matching %v", fs.ErrNotExist)
+						}
+						if _, ok := errors.AsType[*internalError](err); ok {
+							t.Errorf("unexpected internal error %v", err)
+						}
+					}
+					if file != "" || header != nil {
+						t.Errorf("got (%q, %v), want empty result", file, header)
+					}
+					if entries, err := os.ReadDir(tempDir); err != nil {
+						t.Fatal(err)
+					} else if len(entries) != 0 {
+						t.Errorf("unexpected temporary files %v", entries)
+					}
+				}
+				if tt.wantEarlyStop && (body.bytesRead == 0 || body.bytesRead >= len(tt.content)) {
+					t.Errorf("read %d of %d bytes, want an early stop", body.bytesRead, len(tt.content))
+				}
+				if attempts != 1 {
+					t.Errorf("got attempts %d, want 1", attempts)
+				}
+				if !body.closed {
+					t.Error("response body was not closed")
+				}
+			})
+		}
+	})
+
+	t.Run("EncodedBodyLimit", func(t *testing.T) {
+		for _, mode := range []struct {
+			name    string
+			chunked bool
+			gzip    bool
+		}{
+			{"ContentLength", false, false},
+			{"Chunked", true, false},
+			{"Gzip", false, true},
+		} {
+			for _, tt := range []struct {
+				name    string
+				size    int
+				wantErr bool
+			}{
+				{"AtLimit", 6, false},
+				{"AboveLimit", 7, true},
+			} {
+				t.Run(mode.name+"/"+tt.name, func(t *testing.T) {
+					content := strings.Repeat("x", tt.size)
+					body := []byte(content)
+					if mode.gzip {
+						var buf bytes.Buffer
+						zw := gzip.NewWriter(&buf)
+						if _, err := zw.Write(body); err != nil {
+							t.Fatal(err)
+						}
+						if err := zw.Close(); err != nil {
+							t.Fatal(err)
+						}
+						body = buf.Bytes()
+					}
+					server := newHTTPTestServer(t, http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+						if mode.gzip {
+							rw.Header().Set("Content-Encoding", "gzip")
+						}
+						if mode.chunked {
+							rw.(http.Flusher).Flush()
+						} else {
+							rw.Header().Set("Content-Length", strconv.Itoa(len(body)))
+						}
+						rw.Write(body)
+					}))
+					tempDir := t.TempDir()
+					file, header, err := httpGetTemp(t.Context(), http.DefaultClient, server.URL, tempDir, 6)
+					if tt.wantErr {
+						if !errors.Is(err, errBadUpstream) {
+							t.Fatalf("got error %v, want a bad upstream error", err)
+						}
+						if file != "" || header != nil {
+							t.Errorf("got (%q, %v), want empty result", file, header)
+						}
+						if entries, err := os.ReadDir(tempDir); err != nil {
+							t.Fatal(err)
+						} else if len(entries) != 0 {
+							t.Errorf("unexpected temporary files %v", entries)
+						}
+					} else {
+						if err != nil {
+							t.Fatalf("unexpected error %v", err)
+						}
+						if got, err := os.ReadFile(file); err != nil {
+							t.Fatal(err)
+						} else if string(got) != content {
+							t.Errorf("got content %q, want %q", got, content)
+						}
+					}
+				})
+			}
+		}
+	})
+
+	t.Run("MissingTempDir", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "missing")
+		file, _, err := httpGetTemp(t.Context(), http.DefaultClient, "https://example.com", missing, 0)
+		if file != "" {
+			t.Errorf("unexpected temporary file %q", file)
+		}
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), missing) {
+			t.Errorf("got error %v, want a file error for %q", err, missing)
+		}
+		if _, ok := errors.AsType[*internalError](err); !ok {
+			t.Errorf("got error %v, want an internal error", err)
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("got error %v, want an error matching %v", err, fs.ErrNotExist)
+		}
+	})
+
+	for _, tt := range []struct {
+		name            string
+		op              string
+		closeBeforeCopy bool
+	}{
+		{"CloseError", "close", false},
+		{"WriteError", "write", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			body := &testHTTPResponseBody{Reader: strings.NewReader("foobar")}
+			var tempFile *os.File
+			client := &http.Client{Transport: httpRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Cache-Control": {"no-store"}},
+					Body: struct {
+						io.ReadCloser
+						io.WriterTo
+					}{body, writerToFunc(func(w io.Writer) (int64, error) {
+						tempFile = w.(*httpGetTempWriter).Writer.(*os.File)
+						if tt.closeBeforeCopy {
+							if err := tempFile.Close(); err != nil {
+								return 0, err
+							}
+						}
+						n, err := io.Copy(w, body)
+						if err != nil {
+							return n, err
+						}
+						return n, tempFile.Close()
+					})},
+					Request: req,
+				}, nil
+			})}
+			tempDir := t.TempDir()
+			file, header, err := httpGetTemp(t.Context(), client, "https://example.com", tempDir, int64(len("foobar")))
+			if file != "" {
+				t.Errorf("unexpected temporary file %q", file)
+			}
+			if header != nil {
+				t.Errorf("got header %v, want nil", header)
+			}
+			if _, ok := errors.AsType[*internalError](err); !ok {
+				t.Errorf("got error %v, want an internal error", err)
+			}
+			if !errors.Is(err, os.ErrClosed) {
+				t.Errorf("got error %v, want an error matching %v", err, os.ErrClosed)
+			}
+			if tempFile == nil {
+				t.Fatal("temporary file not found")
+			}
+			if pe, ok := errors.AsType[*fs.PathError](err); !ok || pe.Op != tt.op || pe.Path != tempFile.Name() {
+				t.Errorf("got error %v, want a %s error for %q", err, tt.op, tempFile.Name())
+			}
+			if !body.closed || body.bytesRead != len("foobar") {
+				t.Errorf("got response body %+v, want fully read and closed", body)
+			}
+			if entries, err := os.ReadDir(tempDir); err != nil {
+				t.Fatal(err)
+			} else if len(entries) != 0 {
+				t.Errorf("unexpected temporary files %v", entries)
+			}
+		})
+	}
+
+	t.Run("ErrorBodyLimit", func(t *testing.T) {
+		for _, tt := range []struct {
+			name             string
+			chunked          bool
+			gzip             bool
+			header           http.Header
+			wantCacheControl string
+		}{
+			{"ContentLength", false, false, nil, "public, max-age=60"},
+			{"Chunked", true, false, nil, "public, max-age=60"},
+			{"Gzip", false, true, nil, "public, max-age=60"},
+			{"NoStore", false, false, http.Header{"Cache-Control": {"no-store"}}, "no-store"},
+			{"NoCache", true, false, http.Header{"Cache-Control": {"no-cache"}}, "no-store"},
+			{"Private", false, true, http.Header{"Cache-Control": {"private"}}, "no-store"},
+			{"VaryAll", false, false, http.Header{"Vary": {"*"}}, "no-store"},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				body := []byte(strings.Repeat("x", 8<<10))
+				if tt.gzip {
+					var buf bytes.Buffer
+					zw := gzip.NewWriter(&buf)
+					if _, err := zw.Write(body); err != nil {
+						t.Fatal(err)
+					}
+					if err := zw.Close(); err != nil {
+						t.Fatal(err)
+					}
+					body = buf.Bytes()
+				}
+				server := newHTTPTestServer(t, http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+					maps.Copy(rw.Header(), tt.header)
+					if tt.gzip {
+						rw.Header().Set("Content-Encoding", "gzip")
+					}
+					if !tt.chunked {
+						rw.Header().Set("Content-Length", strconv.Itoa(len(body)))
+					}
+					rw.WriteHeader(http.StatusNotFound)
+					if tt.chunked {
+						rw.(http.Flusher).Flush()
+					}
+					rw.Write(body)
+				}))
+				tempDir := t.TempDir()
+				file, _, err := httpGetTemp(t.Context(), http.DefaultClient, server.URL, tempDir, 0)
+				if !errors.Is(err, fs.ErrNotExist) {
+					t.Fatalf("got %v, want %v", err, fs.ErrNotExist)
+				}
+				if got, want := err.Error(), strings.Repeat("x", 4<<10)+"... (truncated)"; got != want {
+					t.Errorf("got %q, want %q", got, want)
+				}
+				for _, method := range []string{http.MethodGet, http.MethodHead} {
+					rec := httptest.NewRecorder()
+					responseError(rec, httptest.NewRequest(method, "/", nil), err)
+					if got, want := rec.Code, http.StatusNotFound; got != want {
+						t.Errorf("method %s: got status %d, want %d", method, got, want)
+					}
+					if got, want := rec.Header().Get("Cache-Control"), tt.wantCacheControl; got != want {
+						t.Errorf("method %s: got cache control %q, want %q", method, got, want)
+					}
+					wantContent := "not found: " + err.Error()
+					if method == http.MethodHead {
+						wantContent = ""
+					}
+					if got, want := rec.Body.String(), wantContent; got != want {
+						t.Errorf("method %s: got content %q, want %q", method, got, want)
+					}
+				}
+				if file != "" {
+					t.Errorf("got temporary file %q, want none", file)
+				}
+				if entries, err := os.ReadDir(tempDir); err != nil {
+					t.Fatal(err)
+				} else if len(entries) != 0 {
+					t.Errorf("got %d temporary files, want none", len(entries))
+				}
+			})
+		}
+	})
+}
+
+func TestHTTPGetTempWriterWrite(t *testing.T) {
+	writeErr := errors.New("write failed")
+	for _, tt := range []struct {
+		name      string
+		maxBytes  int64
+		content   string
+		writeN    int
+		writeErr  error
+		wantN     int
+		wantErr   error
+		wantCalls int
+	}{
+		{"Unlimited", 0, "foobar", 6, nil, 6, nil, 1},
+		{"NegativeLimit", -1, "foobar", 6, nil, 6, nil, 1},
+		{"Empty", 6, "", 0, nil, 0, nil, 1},
+		{"AtLimit", 6, "foobar", 6, nil, 6, nil, 1},
+		{"AboveLimit", 5, "foobar", 6, nil, 0, errBadUpstream, 0},
+		{"WriteError", 6, "foobar", 0, writeErr, 0, writeErr, 1},
+		{"PartialWriteError", 6, "foobar", 3, writeErr, 3, writeErr, 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var content bytes.Buffer
+			calls := 0
+			w := &httpGetTempWriter{
+				Writer: writerFunc(func(p []byte) (int, error) {
+					calls++
+					content.Write(p[:tt.writeN])
+					return tt.writeN, tt.writeErr
+				}),
+				maxBytes: tt.maxBytes,
+			}
+			n, err := w.Write([]byte(tt.content))
+			if got, want := n, tt.wantN; got != want {
+				t.Errorf("got bytes written %d, want %d", got, want)
+			}
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("got error %v, want %v", err, tt.wantErr)
+			}
+			if _, ok := errors.AsType[*internalError](err); ok != (tt.writeErr != nil) {
+				t.Errorf("got internal error %t, want %t", ok, tt.writeErr != nil)
+			}
+			if got, want := w.written, int64(tt.wantN); got != want {
+				t.Errorf("got total bytes written %d, want %d", got, want)
+			}
+			if got, want := content.String(), tt.content[:tt.wantN]; got != want {
+				t.Errorf("got content %q, want %q", got, want)
+			}
+			if got, want := calls, tt.wantCalls; got != want {
+				t.Errorf("got write calls %d, want %d", got, want)
+			}
+		})
+	}
+
+	t.Run("MultipleWrites", func(t *testing.T) {
+		for _, tt := range []struct {
+			name        string
+			prefix      string
+			content     string
+			wantN       int
+			wantErr     error
+			wantContent string
+		}{
+			{"BelowLimit", "foo", "ba", 2, nil, "fooba"},
+			{"ExceedsRemainingLimit", "foo", "bars", 0, errBadUpstream, "foo"},
+			{"AtLimit", "foo", "bar", 3, nil, "foobar"},
+			{"EmptyAtLimit", "foobar", "", 0, nil, "foobar"},
+			{"AboveLimit", "foobar", "x", 0, errBadUpstream, "foobar"},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				var content bytes.Buffer
+				w := &httpGetTempWriter{Writer: &content, maxBytes: 6}
+				if n, err := w.Write([]byte(tt.prefix)); err != nil || n != len(tt.prefix) {
+					t.Fatalf("got initial write (%d, %v), want (%d, nil)", n, err, len(tt.prefix))
+				}
+				n, err := w.Write([]byte(tt.content))
+				if got, want := n, tt.wantN; got != want {
+					t.Errorf("got bytes written %d, want %d", got, want)
+				}
+				if !errors.Is(err, tt.wantErr) {
+					t.Errorf("got error %v, want %v", err, tt.wantErr)
+				}
+				if got, want := content.String(), tt.wantContent; got != want {
+					t.Errorf("got content %q, want %q", got, want)
+				}
+				if got, want := w.written, int64(len(tt.wantContent)); got != want {
+					t.Errorf("got total bytes written %d, want %d", got, want)
+				}
+			})
+		}
+	})
+}
+
+func TestCheckHTTPRedirect(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		url     string
+		via     int
+		wantErr error
+	}{
+		{"HTTP", "http://example.com", 1, nil},
+		{"HTTPS", "https://example.com", 1, nil},
+		{"BeforeLimit", "https://example.com", 9, nil},
+		{"AtLimit", "https://example.com", 10, errors.New("stopped after 10 redirects")},
+		{"File", "file:///secret", 1, http.ErrUseLastResponse},
+		{"OtherScheme", "custom://example.com", 1, http.ErrUseLastResponse},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tt.url, nil)
+			if err := checkHTTPRedirect(req, make([]*http.Request, tt.via)); !compareErrors(err, tt.wantErr) {
+				t.Errorf("got error %v, want %v", err, tt.wantErr)
+			}
+		})
+	}
+
+	t.Run("Clients", func(t *testing.T) {
+		for _, tt := range []struct {
+			name   string
+			client func(http.RoundTripper) *http.Client
+		}{
+			{"Goproxy", func(transport http.RoundTripper) *http.Client {
+				g := &Goproxy{Transport: transport}
+				g.initOnce.Do(g.init)
+				return g.httpClient
+			}},
+			{"GoFetcher", func(transport http.RoundTripper) *http.Client {
+				gf := &GoFetcher{Env: []string{"GOSUMDB=off"}, Transport: transport}
+				gf.initOnce.Do(gf.init)
+				return gf.httpClient
+			}},
+		} {
+			for _, target := range []struct {
+				name       string
+				url        string
+				wantStatus int
+			}{
+				{"HTTP", "http://upstream.example.com/redirected", http.StatusOK},
+				{"HTTPS", "https://upstream.example.com/redirected", http.StatusOK},
+				{"File", "file:///secret", http.StatusFound},
+				{"OtherScheme", "custom://example.com/secret", http.StatusFound},
+			} {
+				t.Run(tt.name+"/"+target.name, func(t *testing.T) {
+					attempts := 0
+					body := &testHTTPResponseBody{Reader: strings.NewReader("redirect response")}
+					client := tt.client(httpRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+						attempts++
+						if attempts == 1 {
+							return &http.Response{
+								StatusCode: http.StatusFound,
+								Status:     "302 Found",
+								Header:     http.Header{"Location": {target.url}},
+								Body:       body,
+							}, nil
+						}
+						if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+							t.Errorf("unexpected redirected request %s", req.URL)
+						}
+						return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+					}))
+					_, err := httpGet(t.Context(), client, "https://example.com/original", nil)
+					wantAttempts := 2
+					if target.wantStatus == http.StatusOK {
+						if err != nil {
+							t.Errorf("unexpected error %v", err)
+						}
+					} else {
+						wantAttempts = 1
+						if e, ok := errors.AsType[*httpError](err); !ok || e.statusCode != target.wantStatus {
+							t.Errorf("got error %v, want HTTP status %d", err, target.wantStatus)
+						}
+					}
+					if attempts != wantAttempts {
+						t.Errorf("got attempts %d, want %d", attempts, wantAttempts)
+					}
+					if !body.closed {
+						t.Error("redirect response body was not closed")
+					}
+				})
+			}
+
+			t.Run(tt.name+"/DirectFile", func(t *testing.T) {
+				dir := t.TempDir()
+				if err := os.WriteFile(filepath.Join(dir, "file.txt"), []byte("foobar"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				transport := http.DefaultTransport.(*http.Transport).Clone()
+				transport.RegisterProtocol("file", http.NewFileTransport(http.Dir(dir)))
+				defer transport.CloseIdleConnections()
+				var content bytes.Buffer
+				_, err := httpGet(t.Context(), tt.client(transport), "file:///file.txt", &content)
+				if err != nil {
+					t.Fatalf("unexpected error %v", err)
+				}
+				if got, want := content.String(), "foobar"; got != want {
+					t.Errorf("got content %q, want %q", got, want)
+				}
+			})
+		}
+	})
+}
+
+func TestIsRetryableHTTPClientDoError(t *testing.T) {
+	for _, tt := range []struct {
+		name            string
+		err             error
+		wantIsRetryable bool
+	}{
+		{"ConnectionReset", syscall.ECONNRESET, true},
+		{"ConnectionRefused", &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}, true},
+		{"UnexpectedEOF", io.ErrUnexpectedEOF, true},
+		{"Unknown", errors.New("oops"), true},
+		{"MisleadingMessage", errors.New("x509: certificate signed by unknown authority"), true},
+		{"Canceled", context.Canceled, false},
+		{"RequestDeadline", context.DeadlineExceeded, true},
+		{"RequestTimeout", testHTTPTimeoutError{}, true},
+		{"RequestTimeoutWithDeadline", errors.Join(testHTTPTimeoutError{}, context.DeadlineExceeded), true},
+		{"RequestTimeoutWithCanceled", errors.Join(testHTTPTimeoutError{}, context.Canceled), false},
+		{"SchemeMismatch", http.ErrSchemeMismatch, false},
+		{"DNSNotFound", &net.DNSError{IsNotFound: true}, false},
+		{"DNSTemporary", &net.DNSError{IsTemporary: true}, true},
+		{"DNSTimeout", &net.DNSError{IsTimeout: true}, true},
+		{"DNSUnclassified", &net.DNSError{Err: "server misbehaving"}, true},
+		{"TLSVerification", &tls.CertificateVerificationError{Err: errors.New("verification failed")}, false},
+		{"TLSUnknownAuthority", &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}, false},
+		{"SystemRoots", x509.SystemRootsError{Err: errors.New("roots unavailable")}, false},
+		{"InvalidCertificate", x509.CertificateInvalidError{Reason: x509.Expired}, false},
+		{"Hostname", x509.HostnameError{Certificate: &x509.Certificate{}, Host: "example.com"}, false},
+		{"UnknownAuthority", x509.UnknownAuthorityError{}, false},
+	} {
+		for _, wrapped := range []struct {
+			name string
+			err  error
+		}{
+			{"Direct", tt.err},
+			{"URL", &url.Error{Op: "Get", URL: "https://example.com", Err: tt.err}},
+			{"Wrapped", fmt.Errorf("request failed: %w", &url.Error{Err: tt.err})},
+			{"Joined", errors.Join(errors.New("other failure"), tt.err)},
+		} {
+			t.Run(tt.name+"/"+wrapped.name, func(t *testing.T) {
+				if got, want := isRetryableHTTPClientDoError(wrapped.err), tt.wantIsRetryable; got != want {
+					t.Errorf("got %t, want %t", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestIsCacheRestrictedHTTPResponse(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		header http.Header
+		want   bool
+	}{
+		{"Absent", nil, false},
+		{"Empty", http.Header{"Cache-Control": {""}}, false},
+		{"Public", http.Header{"Cache-Control": {"public, max-age=60"}}, false},
+		{"NoStore", http.Header{"Cache-Control": {"no-store"}}, true},
+		{"NoCache", http.Header{"Cache-Control": {"no-cache"}}, true},
+		{"Private", http.Header{"Cache-Control": {"private"}}, true},
+		{"MustRevalidate", http.Header{"Cache-Control": {"must-revalidate"}}, true},
+		{"ProxyRevalidate", http.Header{"Cache-Control": {"proxy-revalidate"}}, true},
+		{"FreshMustRevalidate", http.Header{"Cache-Control": {"max-age=60, must-revalidate"}}, true},
+		{"FreshProxyRevalidate", http.Header{"Cache-Control": {"max-age=60, proxy-revalidate"}}, true},
+		{"MixedCaseRevalidation", http.Header{"Cache-Control": {"public, MuSt-ReVaLiDaTe"}}, true},
+		{"RevalidationArgument", http.Header{"Cache-Control": {"proxy-revalidate=invalid"}}, true},
+		{"ZeroMaxAge", http.Header{"Cache-Control": {"max-age=0"}}, true},
+		{"LeadingZeroMaxAge", http.Header{"Cache-Control": {"max-age=000"}}, true},
+		{"LongZeroMaxAge", http.Header{"Cache-Control": {"max-age=" + strings.Repeat("0", 128)}}, true},
+		{"QuotedZeroMaxAge", http.Header{"Cache-Control": {`max-age="0"`}}, true},
+		{"EscapedZeroMaxAge", http.Header{"Cache-Control": {`max-age="\0\00"`}}, true},
+		{"MixedCaseMaxAge", http.Header{"Cache-Control": {"MAX-AGE \t= \t0 \t"}}, true},
+		{"PositiveMaxAge", http.Header{"Cache-Control": {"max-age=60"}}, false},
+		{"LeadingZerosPositiveMaxAge", http.Header{"Cache-Control": {"max-age=00060"}}, false},
+		{"QuotedPositiveMaxAge", http.Header{"Cache-Control": {`max-age="60"`}}, false},
+		{"EscapedPositiveMaxAge", http.Header{"Cache-Control": {`max-age="\60"`}}, false},
+		{"OverflowMaxAge", http.Header{"Cache-Control": {"max-age=" + strings.Repeat("9", 128)}}, false},
+		{"LongLeadingZerosPositiveMaxAge", http.Header{"Cache-Control": {"max-age=" + strings.Repeat("0", 128) + "1"}}, false},
+		{"MissingMaxAge", http.Header{"Cache-Control": {"max-age"}}, true},
+		{"EmptyMaxAge", http.Header{"Cache-Control": {"max-age="}}, true},
+		{"EmptyQuotedMaxAge", http.Header{"Cache-Control": {`max-age=""`}}, true},
+		{"NegativeMaxAge", http.Header{"Cache-Control": {"max-age=-1"}}, true},
+		{"SignedMaxAge", http.Header{"Cache-Control": {"max-age=+1"}}, true},
+		{"FractionalMaxAge", http.Header{"Cache-Control": {"max-age=0.5"}}, true},
+		{"InvalidMaxAge", http.Header{"Cache-Control": {"max-age=invalid"}}, true},
+		{"InvalidMaxAgeSuffix", http.Header{"Cache-Control": {"max-age=60x"}}, true},
+		{"OverflowMaxAgeWithInvalidSuffix", http.Header{"Cache-Control": {"max-age=" + strings.Repeat("9", 128) + "x"}}, true},
+		{"UnterminatedMaxAge", http.Header{"Cache-Control": {`max-age="60`}}, true},
+		{"UnmatchedMaxAgeQuote", http.Header{"Cache-Control": {`max-age=60"`}}, true},
+		{"QuotedMaxAgeWhitespace", http.Header{"Cache-Control": {`max-age=" 60 "`}}, true},
+		{"EscapedMaxAgeBackslash", http.Header{"Cache-Control": {`max-age="\\60"`}}, true},
+		{"UnterminatedMaxAgeEscape", http.Header{"Cache-Control": {`max-age="60\"`}}, true},
+		{"NonDecimalMaxAgeEscape", http.Header{"Cache-Control": {`max-age="\x30"`}}, true},
+		{"DuplicateMaxAge", http.Header{"Cache-Control": {"max-age=60, max-age=60"}}, true},
+		{"DuplicateMaxAgeFields", http.Header{"Cache-Control": {"max-age=60", "max-age=120"}}, true},
+		{"DuplicateZeroMaxAgeFirst", http.Header{"Cache-Control": {"max-age=0, max-age=60"}}, true},
+		{"DuplicateZeroMaxAgeLast", http.Header{"Cache-Control": {"max-age=60, max-age=0"}}, true},
+		{"ZeroSharedMaxAge", http.Header{"Cache-Control": {"s-maxage=0"}}, true},
+		{"PositiveSharedMaxAge", http.Header{"Cache-Control": {"s-maxage=60"}}, true},
+		{"QuotedSharedMaxAge", http.Header{"Cache-Control": {`S-MAXAGE="60"`}}, true},
+		{"MissingSharedMaxAge", http.Header{"Cache-Control": {"s-maxage"}}, true},
+		{"InvalidSharedMaxAge", http.Header{"Cache-Control": {"s-maxage=invalid"}}, true},
+		{"SharedMaxAgeAfterZeroMaxAge", http.Header{"Cache-Control": {"max-age=0, s-maxage=60"}}, true},
+		{"SharedMaxAgeBeforeZeroMaxAge", http.Header{"Cache-Control": {"s-maxage=60, max-age=0"}}, true},
+		{"SharedMaxAgeOverridesPositiveMaxAge", http.Header{"Cache-Control": {"max-age=60", "s-maxage=0"}}, true},
+		{"RevalidationPrefixes", http.Header{"Cache-Control": {"x-must-revalidate, proxy-revalidate-extra, x-s-maxage=0, max-age-extra=0"}}, false},
+		{"QuotedRevalidation", http.Header{"Cache-Control": {`extension="must-revalidate, proxy-revalidate, s-maxage=0, max-age=0"`}}, false},
+		{"RevalidationAfterQuotedArgument", http.Header{"Cache-Control": {`extension="a,b", must-revalidate`}}, true},
+		{"RevalidationAfterSplitQuotedArgument", http.Header{"Cache-Control": {`extension="a`, `b", proxy-revalidate`}}, true},
+		{"SplitQuotedRevalidation", http.Header{"Cache-Control": {`extension="a`, "must-revalidate", "s-maxage=0", `b", max-age=60`}}, false},
+		{"MixedCase", http.Header{"Cache-Control": {"Public, No-StOrE"}}, true},
+		{"Whitespace", http.Header{"Cache-Control": {" \tno-store \t"}}, true},
+		{"MultipleFields", http.Header{"Cache-Control": {"public", "max-age=60", "no-store"}}, true},
+		{"EmptyDirectives", http.Header{"Cache-Control": {",, public, , no-store,"}}, true},
+		{"TrailingComma", http.Header{"Cache-Control": {"public,"}}, false},
+		{"QualifiedNoCache", http.Header{"Cache-Control": {`no-cache="ETag, Last-Modified"`}}, true},
+		{"QualifiedPrivate", http.Header{"Cache-Control": {`private = "X-Private"`}}, true},
+		{"DirectivePrefixes", http.Header{"Cache-Control": {"no-store-extra, x-no-cache, private-extra"}}, false},
+		{"UnquotedArgument", http.Header{"Cache-Control": {"extension=no-store"}}, false},
+		{"QuotedArgument", http.Header{"Cache-Control": {`extension="no-store"`}}, false},
+		{"QuotedCommas", http.Header{"Cache-Control": {`extension="a,no-store,no-cache,private,b", public`}}, false},
+		{"RestrictionAfterQuotedCommas", http.Header{"Cache-Control": {`extension="a,b", no-store`}}, true},
+		{"RestrictionAfterSplitQuotedArgument", http.Header{"Cache-Control": {`extension="a`, `b", no-store`}}, true},
+		{"SplitQuotedArgument", http.Header{"Cache-Control": {`extension="a`, "no-store", "no-cache", "private", `b", public`}}, false},
+		{"EscapedQuote", http.Header{"Cache-Control": {`extension="a\",no-store,b", public`}}, false},
+		{"EscapedBackslash", http.Header{"Cache-Control": {`extension="a\\", no-store`}}, true},
+		{"EscapedBackslashAndQuote", http.Header{"Cache-Control": {`extension="a\\\",no-store,b", public`}}, false},
+		{"VaryAll", http.Header{"Vary": {"*"}}, true},
+		{"VaryFields", http.Header{"Vary": {"Accept-Encoding, Accept"}}, false},
+		{"VaryMultipleFields", http.Header{"Vary": {"Accept-Encoding", "Accept, \t* "}}, true},
+		{"VaryName", http.Header{"Vary": {"X-No-Store"}}, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got, want := isCacheRestrictedHTTPResponse(tt.header), tt.want; got != want {
+				t.Errorf("got %t, want %t", got, want)
+			}
+		})
+	}
+}
+
+func TestParseHTTPRetryAfter(t *testing.T) {
+	now := time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC)
+	for _, tt := range []struct {
+		name  string
+		value string
+		want  time.Time
+	}{
+		{"Empty", "", time.Time{}},
+		{"Whitespace", " \t", time.Time{}},
+		{"Zero", "0", now},
+		{"Seconds", "60", now.Add(time.Minute)},
+		{"LeadingZeros", "00060", now.Add(time.Minute)},
+		{"LongLeadingZeros", strings.Repeat("0", 128) + "1", now.Add(time.Second)},
+		{"SurroundingWhitespace", " \t60\t ", now.Add(time.Minute)},
+		{"Date", "Tue, 29 Sep 2026 12:01:00 GMT", now.Add(time.Minute)},
+		{"RFC850Date", "Tuesday, 29-Sep-26 12:01:00 GMT", now.Add(time.Minute)},
+		{"ANSICDate", "Tue Sep 29 12:01:00 2026", now.Add(time.Minute)},
+		{"PastDate", "Tue, 29 Sep 2026 11:59:00 GMT", now.Add(-time.Minute)},
+		{"MaximumDurationSeconds", "9223372036", now.Add(9223372036 * time.Second)},
+		{"DurationOverflow", "9223372037", now.Add(9223372036 * time.Second)},
+		{"MaximumInteger", "18446744073709551615", now.Add(9223372036 * time.Second)},
+		{"IntegerOverflow", "18446744073709551616", now.Add(9223372036 * time.Second)},
+		{"LongInteger", strings.Repeat("9", 128), now.Add(9223372036 * time.Second)},
+		{"Negative", "-1", time.Time{}},
+		{"Signed", "+1", time.Time{}},
+		{"Fractional", "0.5", time.Time{}},
+		{"Hexadecimal", "0x10", time.Time{}},
+		{"Quoted", "\"1\"", time.Time{}},
+		{"InternalWhitespace", "1 0", time.Time{}},
+		{"Invalid", "invalid", time.Time{}},
+		{"InvalidOverflowSuffix", strings.Repeat("9", 128) + "x", time.Time{}},
+		{"MultipleSeconds", "1, 60", time.Time{}},
+		{"MultipleDates", "Tue, 29 Sep 2026 12:01:00 GMT,Tue, 29 Sep 2026 12:02:00 GMT", time.Time{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseHTTPRetryAfter(tt.value, now); !got.Equal(tt.want) {
+				t.Errorf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+type httpRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f httpRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+type testHTTPResponseBody struct {
+	io.Reader
+	bytesRead int
+	closed    bool
+}
+
+func (b *testHTTPResponseBody) Read(p []byte) (int, error) {
+	n, err := b.Reader.Read(p)
+	b.bytesRead += n
+	return n, err
+}
+
+func (b *testHTTPResponseBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+type testHTTPTimeoutError struct{}
+
+func (testHTTPTimeoutError) Error() string { return "timeout awaiting response headers" }
+
+func (testHTTPTimeoutError) Timeout() bool { return true }
+
+func (testHTTPTimeoutError) Is(target error) bool { return target == context.DeadlineExceeded }

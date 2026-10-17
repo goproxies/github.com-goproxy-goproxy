@@ -2,153 +2,85 @@ package goproxy
 
 import (
 	"context"
-	"errors"
-	"hash"
+	"fmt"
 	"io"
-	"mime"
 	"os"
-	"path"
-	"strings"
-	"time"
+	"path/filepath"
 )
 
-// ErrCacheNotFound is the error resulting if a path search failed to find a
-// cache.
-var ErrCacheNotFound = errors.New("cache not found")
-
-// Cacher is the interface that defines a set of methods used to cache module
-// files for the `Goproxy`.
-//
-// If you are looking for some useful implementations of the `Cacher`, simply
-// visit the "github.com/goproxy/goproxy/cacher" package.
+// Cacher defines a set of intuitive methods used to cache content served by [Goproxy].
 type Cacher interface {
-	// NewHash returns a new instance of the `hash.Hash` used to compute the
-	// checksums of the caches in the underlying cacher.
-	NewHash() hash.Hash
-
-	// Cache returns the matched `Cache` for the name from the underlying
-	// cacher. It returns the `ErrCacheNotFound` if not found.
+	// Get gets the matched cache for the name. It returns [fs.ErrNotExist]
+	// if not found.
 	//
-	// It is the caller's responsibility to close the returned `Cache`.
-	Cache(ctx context.Context, name string) (Cache, error)
+	// The returned [io.ReadCloser] may optionally implement the following
+	// interfaces:
+	//  1. [io.Seeker], mainly for the Range request header.
+	//  2. interface{ Size() int64 }, mainly for the Content-Length response
+	//     header. It takes effect only if 1 is not implemented.
+	//  3. interface{ LastModified() time.Time }, mainly for the
+	//     Last-Modified response header. Also for the If-Unmodified-Since,
+	//     If-Modified-Since, and If-Range request headers when 1 is
+	//     implemented.
+	//  4. interface{ ModTime() time.Time }, same as 2 but with lower
+	//     priority.
+	//  5. interface{ ETag() string }, mainly for the ETag response header.
+	//     Also for the If-Match, If-None-Match, and If-Range request
+	//     headers when 1 is implemented. Note that the return value will be
+	//     assumed to have complied with RFC 7232, section 2.3, so it will
+	//     be used directly without further processing.
+	Get(ctx context.Context, name string) (io.ReadCloser, error)
 
-	// SetCache sets the c to the underlying cacher.
-	//
-	// It is the caller's responsibility to close the c.
-	SetCache(ctx context.Context, c Cache) error
+	// Put puts a cache for the name with the content.
+	Put(ctx context.Context, name string, content io.ReadSeeker) error
 }
 
-// Cache is the cache unit of the `Cacher`.
-type Cache interface {
-	io.Reader
-	io.Seeker
-	io.Closer
+// DirCacher implements [Cacher] using a directory on the local disk.
+//
+// If the directory does not exist, it will be created with 0755 permissions.
+// Cache entries are stored as files with 0644 permissions.
+type DirCacher string
 
-	// Name returns the unique Unix path style name of the underlying cache.
-	Name() string
-
-	// MIMEType returns the MIME type of the underlying cache.
-	MIMEType() string
-
-	// Size returns the length in bytes of the underlying cache.
-	Size() int64
-
-	// ModTime returns the modification time of the underlying cache.
-	ModTime() time.Time
-
-	// Checksum returns the checksum of the underlying cache.
-	Checksum() []byte
-}
-
-// tempCache implements the `Cache`.
-type tempCache struct {
-	file     *os.File
-	name     string
-	mimeType string
-	size     int64
-	modTime  time.Time
-	checksum []byte
-}
-
-// newTempCache returns a new instance of the `tempCache` with the filename,
-// name, and fileHash.
-func newTempCache(filename, name string, fileHash hash.Hash) (Cache, error) {
-	file, err := os.Open(filename)
+// Get implements [Cacher].
+func (dc DirCacher) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	f, err := os.Open(filepath.Join(string(dc), filepath.FromSlash(name)))
 	if err != nil {
 		return nil, err
 	}
-
-	var mimeType string
-	switch ext := strings.ToLower(path.Ext(name)); ext {
-	case ".info":
-		mimeType = "application/json; charset=utf-8"
-	case ".mod":
-		mimeType = "text/plain; charset=utf-8"
-	case ".zip":
-		mimeType = "application/zip"
-	default:
-		mimeType = mime.TypeByExtension(ext)
-	}
-
-	fileInfo, err := file.Stat()
+	fi, err := f.Stat()
 	if err != nil {
+		f.Close()
 		return nil, err
 	}
+	return &struct {
+		*os.File
+		os.FileInfo
+	}{f, fi}, nil
+}
 
-	if _, err := io.Copy(fileHash, file); err != nil {
-		return nil, err
+// Put implements [Cacher].
+func (dc DirCacher) Put(ctx context.Context, name string, content io.ReadSeeker) error {
+	file := filepath.Join(string(dc), filepath.FromSlash(name))
+	dir := filepath.Dir(file)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return nil, err
+	f, err := os.CreateTemp(dir, fmt.Sprintf(".%s.tmp.*", filepath.Base(file)))
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err := io.Copy(f, content); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
 	}
 
-	return &tempCache{
-		file:     file,
-		name:     name,
-		mimeType: mimeType,
-		size:     fileInfo.Size(),
-		modTime:  fileInfo.ModTime(),
-		checksum: fileHash.Sum(nil),
-	}, nil
-}
-
-// Read implements the `Cache`.
-func (tc *tempCache) Read(b []byte) (int, error) {
-	return tc.file.Read(b)
-}
-
-// Seek implements the `Cache`.
-func (tc *tempCache) Seek(offset int64, whence int) (int64, error) {
-	return tc.file.Seek(offset, whence)
-}
-
-// Close implements the `Cache`.
-func (tc *tempCache) Close() error {
-	return tc.file.Close()
-}
-
-// Name implements the `Cache`.
-func (tc *tempCache) Name() string {
-	return tc.name
-}
-
-// MIMEType implements the `Cache`.
-func (tc *tempCache) MIMEType() string {
-	return tc.mimeType
-}
-
-// Size implements the `Cache`.
-func (tc *tempCache) Size() int64 {
-	return tc.size
-}
-
-// ModTime implements the `Cache`.
-func (tc *tempCache) ModTime() time.Time {
-	return tc.modTime
-}
-
-// Checksum implements the `Cache`.
-func (tc *tempCache) Checksum() []byte {
-	return tc.checksum
+	if err := os.Chmod(f.Name(), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), file)
 }

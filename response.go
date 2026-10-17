@@ -1,73 +1,207 @@
 package goproxy
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 )
 
-// setResponseCacheControlHeader sets the Cache-Control header based on the
-// maxAge.
+// setResponseCacheControlHeader sets the Cache-Control header based on the maxAge.
 func setResponseCacheControlHeader(rw http.ResponseWriter, maxAge int) {
-	cacheControl := ""
-	if maxAge >= 0 {
-		cacheControl = fmt.Sprintf("public, max-age=%d", maxAge)
-	} else {
-		cacheControl = "must-revalidate, no-cache, no-store"
+	if maxAge < -1 {
+		return
 	}
-
+	cacheControl := ""
+	if maxAge == -1 {
+		cacheControl = "no-store"
+	} else {
+		cacheControl = fmt.Sprintf("public, max-age=%d", maxAge)
+	}
 	rw.Header().Set("Cache-Control", cacheControl)
 }
 
 // responseString responses the s as a "text/plain" content to the client with
-// the statusCode.
-func responseString(rw http.ResponseWriter, statusCode int, s string) {
+// the statusCode and cacheControlMaxAge.
+func responseString(rw http.ResponseWriter, req *http.Request, statusCode, cacheControlMaxAge int, s string) {
 	rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	setResponseCacheControlHeader(rw, cacheControlMaxAge)
 	rw.WriteHeader(statusCode)
-	rw.Write([]byte(s))
+	if req.Method != http.MethodHead {
+		rw.Write([]byte(s))
+	}
 }
 
-// responseJSON responses the b as a "application/json" content to the client
-// with the statusCode.
-func responseJSON(rw http.ResponseWriter, statusCode int, b []byte) {
-	rw.Header().Set("Content-Type", "application/json; charset=utf-8")
-	rw.WriteHeader(statusCode)
-	rw.Write(b)
+// responseBadRequest responses "bad request" to the client with optional msgs.
+func responseBadRequest(rw http.ResponseWriter, req *http.Request, msgs ...any) {
+	var msg string
+	if len(msgs) > 0 {
+		msg = fmt.Sprint(msgs...)
+		if msg != "" && msg != "bad request" && !strings.HasPrefix(msg, "bad request: ") {
+			msg = "bad request: " + msg
+		}
+	}
+	if msg == "" {
+		msg = "bad request"
+	}
+	responseString(rw, req, http.StatusBadRequest, -1, msg)
 }
 
-// responseNotFound responses "not found" to the client with the optional msgs.
-func responseNotFound(rw http.ResponseWriter, msgs ...interface{}) {
+// responseNotFound responses "not found" to the client with the
+// cacheControlMaxAge and optional msgs.
+func responseNotFound(rw http.ResponseWriter, req *http.Request, cacheControlMaxAge int, msgs ...any) {
 	var msg string
 	if len(msgs) > 0 {
 		msg = strings.TrimPrefix(fmt.Sprint(msgs...), "bad request: ")
 		msg = strings.TrimPrefix(msg, "gone: ")
-		if msg != "" && !strings.HasPrefix(msg, "not found: ") {
-			msg = fmt.Sprint("not found: ", msg)
+		if msg != "" && msg != "not found" && !strings.HasPrefix(msg, "not found: ") {
+			msg = "not found: " + msg
 		}
 	}
-
 	if msg == "" {
 		msg = "not found"
 	}
-
-	responseString(rw, http.StatusNotFound, msg)
+	responseString(rw, req, http.StatusNotFound, cacheControlMaxAge, msg)
 }
 
-// responseMethodNotAllowed responses "method not allowed" to the client.
-func responseMethodNotAllowed(rw http.ResponseWriter) {
-	responseString(rw, http.StatusMethodNotAllowed, "method not allowed")
+// responseMethodNotAllowed responses "method not allowed" to the client with
+// the cacheControlMaxAge.
+func responseMethodNotAllowed(rw http.ResponseWriter, req *http.Request, cacheControlMaxAge int) {
+	rw.Header().Set("Allow", "GET, HEAD")
+	responseString(rw, req, http.StatusMethodNotAllowed, cacheControlMaxAge, "method not allowed")
 }
 
 // responseInternalServerError responses "internal server error" to the client.
-func responseInternalServerError(rw http.ResponseWriter) {
-	responseString(
-		rw,
-		http.StatusInternalServerError,
-		"internal server error",
-	)
+func responseInternalServerError(rw http.ResponseWriter, req *http.Request) {
+	responseString(rw, req, http.StatusInternalServerError, -1, "internal server error")
 }
 
-// responseBadGateway responses "bad gateway" to the client.
-func responseBadGateway(rw http.ResponseWriter) {
-	responseString(rw, http.StatusBadGateway, "bad gateway")
+// responseContent responds to the client with the content using the contentType
+// and cacheControlMaxAge.
+func responseContent(rw http.ResponseWriter, req *http.Request, content io.Reader, contentType string, cacheControlMaxAge int) {
+	rw.Header().Set("Content-Type", contentType)
+	setResponseCacheControlHeader(rw, cacheControlMaxAge)
+
+	var lastModified time.Time
+	if lm, ok := content.(interface{ LastModified() time.Time }); ok {
+		lastModified = lm.LastModified()
+	} else if mt, ok := content.(interface{ ModTime() time.Time }); ok {
+		lastModified = mt.ModTime()
+	}
+
+	if et, ok := content.(interface{ ETag() string }); ok {
+		if etag := et.ETag(); etag != "" {
+			rw.Header().Set("ETag", etag)
+		}
+	}
+
+	if content, ok := content.(io.ReadSeeker); ok {
+		// Ignore Range on HEAD requests as required by RFC 9110, Section 14.2.
+		if req.Method == http.MethodHead && req.Header.Get("Range") != "" {
+			req = req.Clone(req.Context())
+			req.Header.Del("Range")
+		}
+		http.ServeContent(serveContentResponseWriter{rw}, req, "", lastModified, content)
+		return
+	}
+
+	if s, ok := content.(interface{ Size() int64 }); ok {
+		if size := s.Size(); size > 0 {
+			rw.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		}
+	}
+
+	if !lastModified.IsZero() {
+		rw.Header().Set("Last-Modified", lastModified.UTC().Format(http.TimeFormat))
+	}
+
+	rw.WriteHeader(http.StatusOK)
+	if req.Method == http.MethodHead {
+		return
+	}
+
+	if _, err := io.Copy(rw, content); err != nil {
+		// Abort the response so incomplete content is not treated as complete.
+		panic(http.ErrAbortHandler)
+	}
+}
+
+// responseError responses error to the client with the err.
+func responseError(rw http.ResponseWriter, req *http.Request, err error) {
+	if _, ok := errors.AsType[*internalError](err); ok {
+		responseInternalServerError(rw, req)
+		return
+	}
+
+	isBadUpstream := isBadUpstreamError(err)
+	isFetchTimedOut := isFetchTimedOutError(err)
+	if errors.Is(err, fs.ErrNotExist) {
+		cacheControlMaxAge := -1
+		if _, ok := errors.AsType[*uncacheableNotExistError](err); !ok && !isBadUpstream && !isFetchTimedOut {
+			cacheControlMaxAge = 60
+		}
+		msg := err.Error()
+		if err == fs.ErrNotExist {
+			msg = "not found"
+		}
+		responseNotFound(rw, req, cacheControlMaxAge, msg)
+	} else if isBadUpstream {
+		responseNotFound(rw, req, -1, errBadUpstream)
+	} else if isFetchTimedOut {
+		responseNotFound(rw, req, -1, errFetchTimedOut)
+	} else {
+		responseInternalServerError(rw, req)
+	}
+}
+
+// responseUpstreamError is like [responseError] but reports upstream failures
+// with 502, 503, or 504. Local failures must be marked with [internalError],
+// and missing resources with [notExistError].
+func responseUpstreamError(rw http.ResponseWriter, req *http.Request, err error) {
+	if _, ok := errors.AsType[*internalError](err); ok || errors.Is(err, context.Canceled) {
+		responseInternalServerError(rw, req)
+		return
+	}
+	if _, ok := errors.AsType[*notExistError](err); ok {
+		responseError(rw, req, err)
+		return
+	}
+
+	statusCode := http.StatusBadGateway
+	if httpErr, ok := errors.AsType[*httpError](err); ok {
+		switch httpErr.statusCode {
+		case http.StatusTooManyRequests, http.StatusServiceUnavailable:
+			statusCode = http.StatusServiceUnavailable
+		case http.StatusRequestTimeout, http.StatusGatewayTimeout:
+			statusCode = http.StatusGatewayTimeout
+		}
+	}
+	if isFetchTimedOutError(err) {
+		statusCode = http.StatusGatewayTimeout
+	}
+	responseString(rw, req, statusCode, -1, strings.ToLower(http.StatusText(statusCode)))
+}
+
+// serveContentResponseWriter sets the cache policy for errors generated by [http.ServeContent].
+type serveContentResponseWriter struct {
+	http.ResponseWriter
+}
+
+// WriteHeader disables caching for errors before writing the status code.
+func (rw serveContentResponseWriter) WriteHeader(statusCode int) {
+	if statusCode >= http.StatusBadRequest {
+		setResponseCacheControlHeader(rw, -1)
+	}
+	rw.ResponseWriter.WriteHeader(statusCode)
+}
+
+// ReadFrom copies r to the underlying writer, preserving its [io.ReaderFrom]
+// optimization when available.
+func (rw serveContentResponseWriter) ReadFrom(r io.Reader) (int64, error) {
+	return io.Copy(rw.ResponseWriter, r)
 }

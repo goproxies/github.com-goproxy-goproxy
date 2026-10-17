@@ -1,58 +1,57 @@
 # Goproxy
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/goproxy/goproxy)](https://goreportcard.com/report/github.com/goproxy/goproxy)
-[![GoDoc](https://godoc.org/github.com/goproxy/goproxy?status.svg)](https://godoc.org/github.com/goproxy/goproxy)
+[![Test](https://github.com/goproxy/goproxy/actions/workflows/test.yaml/badge.svg)](https://github.com/goproxy/goproxy/actions/workflows/test.yaml)
+[![codecov](https://codecov.io/gh/goproxy/goproxy/branch/master/graph/badge.svg)](https://codecov.io/gh/goproxy/goproxy)
+[![Go Reference](https://pkg.go.dev/badge/github.com/goproxy/goproxy.svg)](https://pkg.go.dev/github.com/goproxy/goproxy)
 
 A minimalist Go module proxy handler.
 
-Goproxy has fully implemented the Go's
-[module proxy protocol](https://golang.org/cmd/go/#hdr-Module_proxy_protocol).
-Our goal is to find the most dead simple way to provide a minimalist handler
-that can act as a full-featured Go module proxy for those who want to build
-their own proxies. Yeah, there is no `Makefile`, no configuration files, no
-crazy file organization, no lengthy documentation, no annoying stuff, just a
-[`goproxy.Goproxy`](https://godoc.org/github.com/goproxy/goproxy#Goproxy) that
-implements the [`http.Handler`](https://godoc.org/net/http#Handler).
+Goproxy has fully implemented the [GOPROXY protocol](https://go.dev/ref/mod#goproxy-protocol). The goal of this project
+is to find the most dead simple way to provide a minimalist handler that can act as a full-featured Go module proxy for
+those who want to build their own proxies.
 
 ## Features
 
-* Extremely easy to use
-	* One struct: [`goproxy.Goproxy`](https://godoc.org/github.com/goproxy/goproxy#Goproxy)
-	* Two interfaces: [`goproxy.Cacher`](https://godoc.org/github.com/goproxy/goproxy#Cacher) and [`goproxy.Cache`](https://godoc.org/github.com/goproxy/goproxy#Cache)
-* Built-in [`GOPROXY`](https://golang.org/cmd/go/#hdr-Environment_variables) support
-	* Defaulted to `https://proxy.golang.org,direct` (just like what Go is doing right now)
-* Built-in [`GONOPROXY`](https://golang.org/cmd/go/#hdr-Environment_variables) support
-* Built-in [`GOSUMDB`](https://golang.org/cmd/go/#hdr-Environment_variables) support
-	* Defaulted to `sum.golang.org` (just like what Go is doing right now)
-* Built-in [`GONOSUMDB`](https://golang.org/cmd/go/#hdr-Environment_variables) support
-* Built-in [`GOPRIVATE`](https://golang.org/cmd/go/#hdr-Environment_variables) support
-* Supports serving under other Go module proxies by setting [`GOPROXY`](https://golang.org/cmd/go/#hdr-Environment_variables)
-* Supports [proxying checksum databases](http://golang.org/design/25530-sumdb#proxying-a-checksum-database)
-* Supports multiple mainstream implementations of the [`goproxy.Cacher`](https://godoc.org/github.com/goproxy/goproxy#Cacher)
-	* Disk: [`cacher.Disk`](https://godoc.org/github.com/goproxy/goproxy/cacher#Disk)
-	* MinIO: [`cacher.MinIO`](https://godoc.org/github.com/goproxy/goproxy/cacher#MinIO)
-	* Google Cloud Storage: [`cacher.GCS`](https://godoc.org/github.com/goproxy/goproxy/cacher#GCS)
-	* Amazon Simple Storage Service: [`cacher.S3`](https://godoc.org/github.com/goproxy/goproxy/cacher#S3)
-	* Microsoft Azure Blob Storage: [`cacher.MABS`](https://godoc.org/github.com/goproxy/goproxy/cacher#MABS)
-	* DigitalOcean Spaces: [`cacher.DOS`](https://godoc.org/github.com/goproxy/goproxy/cacher#DOS)
-	* Alibaba Cloud Object Storage Service: [`cacher.OSS`](https://godoc.org/github.com/goproxy/goproxy/cacher#OSS)
-	* Qiniu Cloud Kodo: [`cacher.Kodo`](https://godoc.org/github.com/goproxy/goproxy/cacher#Kodo)
+- Extremely easy to use
+  - Three structs: [`goproxy.Goproxy`](https://pkg.go.dev/github.com/goproxy/goproxy#Goproxy),
+    [`goproxy.GoFetcher`](https://pkg.go.dev/github.com/goproxy/goproxy#GoFetcher), and
+    [`goproxy.DirCacher`](https://pkg.go.dev/github.com/goproxy/goproxy#DirCacher)
+  - Two interfaces: [`goproxy.Fetcher`](https://pkg.go.dev/github.com/goproxy/goproxy#Fetcher) and
+    [`goproxy.Cacher`](https://pkg.go.dev/github.com/goproxy/goproxy#Cacher)
+  - Ready-to-use [CLI](https://github.com/goproxy/goproxy/releases) and
+    [Docker image](https://github.com/goproxy/goproxy/pkgs/container/goproxy)
+- Built-in implementation of `GOPROXY`, `GONOPROXY`, `GOSUMDB`, `GONOSUMDB`, and `GOPRIVATE`
+- Upstream proxy support
+- [Checksum database proxying](https://go.dev/design/25530-sumdb#proxying-a-checksum-database) support
+- `Disable-Module-Fetch` header support
 
 ## Installation
 
-Open your terminal and execute
+- To use this project programmatically, `go get` it:
 
-```bash
-$ go get github.com/goproxy/goproxy
-```
+  ```bash
+  go get github.com/goproxy/goproxy
+  ```
 
-done.
+- To use this project from the command line, download the pre-built binaries from
+  [here](https://github.com/goproxy/goproxy/releases) or build it from source:
 
-> The only requirement is the [Go](https://golang.org), at least v1.12.
+  ```bash
+  go install github.com/goproxy/goproxy/cmd/goproxy@latest
+  ```
 
-## Quick Start
+- To use this project with Docker, pull the pre-built images from
+  [here](https://github.com/goproxy/goproxy/pkgs/container/goproxy):
 
-Create a file named `goproxy.go`
+  ```bash
+  docker pull ghcr.io/goproxy/goproxy
+  ```
+
+## Quickstart
+
+<details><summary>Write code</summary>
+
+Create a file named `goproxy.go`:
 
 ```go
 package main
@@ -64,82 +63,87 @@ import (
 )
 
 func main() {
-	http.ListenAndServe("localhost:8080", goproxy.New())
+	http.ListenAndServe("localhost:8080", &goproxy.Goproxy{})
 }
 ```
 
-and run it
+Then run it with a `GOMODCACHE` that differs from `go env GOMODCACHE`:
 
 ```bash
-$ go run goproxy.go
+GOMODCACHE=/tmp/goproxy-gomodcache go run goproxy.go
 ```
 
-then try it by setting `GOPROXY` to `http://localhost:8080` by following the
-instructions below. In addition, we also recommend that you set `GO111MODULE` to
-`on` instead of `auto` when you are working with Go modules.
-
-### Go 1.13 and above (RECOMMENDED)
-
-Open your terminal and execute
+Finally, set `GOPROXY` to try it out:
 
 ```bash
-$ go env -w GOPROXY=http://localhost:8080,direct
+go env -w GOPROXY=http://localhost:8080,direct
 ```
 
-done.
+For more details, refer to the [documentation](https://pkg.go.dev/github.com/goproxy/goproxy).
 
-### macOS or Linux
+</details>
 
-Open your terminal and execute
+<details><summary>Run from command line</summary>
+
+Refer to the [Installation](#installation) section to download or build the binary.
+
+Then run it with a `GOMODCACHE` that differs from `go env GOMODCACHE`:
 
 ```bash
-$ export GOPROXY=http://localhost:8080
+GOMODCACHE=/tmp/goproxy-gomodcache goproxy server --address localhost:8080
 ```
 
-or
+Finally, set `GOPROXY` to try it out:
 
 ```bash
-$ echo "export GOPROXY=http://localhost:8080" >> ~/.profile && source ~/.profile
+go env -w GOPROXY=http://localhost:8080,direct
 ```
 
-done.
+For more details, check its usage:
 
-### Windows
-
-Open your PowerShell and execute
-
-```poweshell
-C:\> $env:GOPROXY = "http://localhost:8080"
+```bash
+goproxy --help
 ```
 
-or
+</details>
 
-```md
-1. Open the Start Search, type in "env"
-2. Choose the "Edit the system environment variables"
-3. Click the "Environment Variables…" button
-4. Under the "User variables for <YOUR_USERNAME>" section (the upper half)
-5. Click the "New..." button
-6. Choose the "Variable name" input bar, type in "GOPROXY"
-7. Choose the "Variable value" input bar, type in "http://localhost:8080"
-8. Click the "OK" button
+<details><summary>Run with Docker</summary>
+
+Refer to the [Installation](#installation) section to pull the image.
+
+Then run it:
+
+```bash
+docker run -p 8080:8080 ghcr.io/goproxy/goproxy server --address :8080
 ```
 
-done.
+Finally, set `GOPROXY` to try it out:
+
+```bash
+go env -w GOPROXY=http://localhost:8080,direct
+```
+
+For more details, check its usage:
+
+```bash
+docker run ghcr.io/goproxy/goproxy --help
+```
+
+</details>
 
 ## Community
 
-If you want to discuss Goproxy, or ask questions about it, simply post questions
-or ideas [here](https://github.com/goproxy/goproxy/issues).
+If you have any questions or ideas about this project, feel free to discuss them
+[here](https://github.com/goproxy/goproxy/discussions).
 
 ## Contributing
 
-If you want to help build Goproxy, simply follow
-[this](https://github.com/goproxy/goproxy/wiki/Contributing) to send pull
-requests [here](https://github.com/goproxy/goproxy/pulls).
+If you would like to contribute to this project, please submit issues [here](https://github.com/goproxy/goproxy/issues)
+or pull requests [here](https://github.com/goproxy/goproxy/pulls).
+
+When submitting a pull request, please make sure its commit messages adhere to
+[Conventional Commits 1.0.0](https://www.conventionalcommits.org/en/v1.0.0/).
 
 ## License
 
-This project is licensed under the Unlicense.
-
-License can be found [here](LICENSE).
+This project is licensed under the [MIT License](LICENSE).
